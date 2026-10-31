@@ -1,0 +1,4724 @@
+/* ------------------------------------------------------------------ */
+/*  خراط‌کد — موتور هندسه، مسیر ابزار و جی‌کد برای خراطی دومحور (X/Z)   */
+/* ------------------------------------------------------------------ */
+
+import type { SketchSeg } from "./sketch";
+
+export interface PPoint {
+  id: number;
+  z: number; // موقعیت طولی (mm)
+  r: number; // شعاع (mm)
+  smooth: boolean; // نقطه صاف (اسپلاین) یا گوشه
+}
+
+/** روش خشن‌تراشی: کلاسیک (یک‌طرفه) | رفت‌وبرگشتی (زیگزاگ) | ناحیه‌ای */
+export type RoughMode = "classic" | "zigzag" | "zone";
+
+export const ROUGH_MODES: { id: RoughMode; name: string }[] = [
+  { id: "classic", name: "یک طرفه" },
+  { id: "zigzag", name: "دو طرفه" },
+  { id: "zone", name: "ناحیه‌ای دو طرفه" },
+];
+
+/* ---------------- شکل مقطع خام و پوشش دورانی ---------------- */
+
+/** شکل مقطع خام: دایره | مربع | شش‌ضلعی | هشت‌ضلعی */
+export type BlankShape = "circle" | "square" | "hex" | "octagon";
+
+export const BLANK_SHAPES: { id: BlankShape; name: string; sides: number }[] = [
+  { id: "circle", name: "دایره‌ای", sides: 0 },
+  { id: "square", name: "مربعی", sides: 4 },
+  { id: "hex", name: "شش‌ضلعی", sides: 6 },
+  { id: "octagon", name: "هشت‌ضلعی", sides: 8 },
+];
+
+/**
+ * محاسبهٔ پوشش دورانی خام: هنگام چرخش، گوشه‌های مقطعِ چندضلعی دایره‌ای بزرگ‌تر
+ * از «قطر واقعی» (قطر محاطی / فاصلهٔ بین لبه‌های موازی) را جاروب می‌کنند.
+ * قطر واقعی = blankD (قطر محاطی) و قطر مؤثر دوران = قطر محیطی (دورترین گوشه).
+ */
+export function rotationalEnvelope(blankD: number, shape: BlankShape): {
+  maxRotD: number; // قطر مؤثر دوران (پوشش حداکثری)
+  inR: number; // شعاع محاطی (قطر واقعی / ۲)
+  outR: number; // شعاع محیطی (دورترین نقطه از محور)
+  sides: number; // تعداد اضلاع (۰ = دایره)
+  hasCorners: boolean;
+  growth: number; // میزان افزایش نسبت به قطر واقعی
+} {
+  const s = BLANK_SHAPES.find((b) => b.id === shape);
+  const inR = blankD / 2;
+  if (!s || s.sides === 0) {
+    return { maxRotD: blankD, inR, outR: inR, sides: 0, hasCorners: false, growth: 0 };
+  }
+  const outR = inR / Math.cos(Math.PI / s.sides);
+  return {
+    maxRotD: outR * 2,
+    inR,
+    outR,
+    sides: s.sides,
+    hasCorners: true,
+    growth: outR * 2 - blankD,
+  };
+}
+
+/* ---------------- نقطه Split و هلدر دوم (کاسه) ---------------- */
+
+/**
+ * نقطه تعیین‌کننده (Split Point): زنجیرهٔ پروفیل را به دو شاخه تقسیم می‌کند —
+ * شاخهٔ «خارج کاسه» (External) و شاخهٔ «داخل کاسه» (Internal).
+ */
+export interface SplitState {
+  enabled: boolean;
+  z: number; // موقعیت طولی نقطه روی پروفیل (mm)
+  r: number; // شعاع نقطه روی پروفیل (mm)
+  /** جابه‌جایی عمدی شاخه‌های داخل/خارج نسبت به ترتیب زنجیره */
+  swapped?: boolean;
+}
+
+/**
+ * هلدر دوم (داخل‌تراش): نسبت به هلدر اول ۹۰ درجه در جهت منفی چرخیده است.
+ * موقعیت مکانی آن ثابت نیست؛ اپراتور با دو آفست آن را تنظیم می‌کند:
+ * xOff = فاصله در جهت ‎+X‎ محلی ، yOff = فاصله در جهت ‎−Y‎ محلی.
+ */
+export const MIN_INNER_DISTANCE = 1;
+export const MAX_INNER_DISTANCE = 999;
+
+export interface Holder2State {
+  xOff: number;
+  yOff: number;
+}
+
+/** مختصات خوانده‌شدهٔ یک هلدر در دستگاه (محورهای X طولی و Y شعاعی). */
+export interface HolderMachinePoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * کالیبراسیون اختیاری از روی مختصات مطلق دو هلدر:
+ *   Xoff = X₂ − X₁  (هلدر دوم در جهت +X)
+ *   Yoff = Y₁ − Y₂  (هلدر دوم در جهت −Y)
+ *
+ * این تابع فقط اختلاف واقعی را برمی‌گرداند؛ حداقل مجاز دستگاه در UI اعتبارسنجی
+ * می‌شود تا مختصات اشتباه به‌طور پنهانی clamp نشود.
+ */
+export function holder2OffsetFromCoordinates(
+  holder1: HolderMachinePoint,
+  holder2: HolderMachinePoint
+): Holder2State {
+  const round2 = (v: number) => Math.round(v * 100) / 100;
+  return {
+    xOff: round2(holder2.x - holder1.x),
+    yOff: round2(holder1.y - holder2.y),
+  };
+}
+
+/** چرخش ثابت هلدر دوم نسبت به هلدر اول (درجه) */
+export const HOLDER2_ROT = -90;
+
+export const DEFAULT_SPLIT: SplitState = { enabled: false, z: 90, r: 68 };
+export const DEFAULT_HOLDER2: Holder2State = { xOff: 50, yOff: 50 };
+export const MIN_HOLDER2_OFFSET = 50;
+
+export interface Params {
+  blankD: number; // قطر خام
+  blankL: number; // طول خام
+  blankShape: BlankShape; // شکل مقطع خام
+  doc: number; // عمق بار خشن بیرونی (شعاع)
+  innerDoc: number; // عمق بار مستقل عملیات داخل‌تراشی (کف‌تراشی و خشن داخل)
+  offsetDist: number; // فاصله آفست — مرجع مراحل خشن قبل از پرداخت بیرونی
+  innerOffsetDist: number; // فاصله آفست داخل‌تراشی — مرجع خشن و پاس پیش از پرداخت داخل
+  innerStartClearance: number; // فاصله شروع داخل‌تراشی جلوتر از اولین عملیات H2
+  innerEndTravel: number; // حرکت مستقیم +X پس از آخرین عملیات داخل‌تراشی
+  bottomRoughOverlap: number; // همپوشانی خشن شعاعی و کف‌تراشی
+  bottomOffsetClearance: number; // فاصله کف‌تراشی در +X از بلندترین قله آفست داخل
+  extraCutEachSide: number; // برداشت اضافه گردکردن/خشن شعاعی بیرون از هر سر خام
+  gcodeShiftX: number; // جابه‌جایی سراسری کل جی‌کد در راستای محور X (طولی)
+  gcodeShiftY: number; // جابه‌جایی سراسری کل جی‌کد در راستای محور Y (شعاعی)
+  smartTransferEnabled: boolean; // جابه‌جایی مستطیلی G0 و برش معکوس خطوط در بازه زاویه
+  smartTransferAngleMin: number; // حد پایین زاویه خط نسبت به محور X طراحی
+  smartTransferAngleMax: number; // حد بالای زاویه خط نسبت به محور X طراحی
+  feedRough: number; // mm/min
+  feedFinish: number; // mm/min (سازگاری پروژه‌های قدیمی)
+  /** فید مستقل هر عملیات؛ تنظیم سراسری Preferences هنگام تولید تزریق می‌شود. */
+  feedByKind?: Partial<Record<Exclude<SegKind, "rapid">, number>>;
+  rpm: number;
+  tool: ToolSpec; // مشخصات مهندسی ابزار
+  safety: number; // فاصله امن جمع‌کردن
+  roughMode: RoughMode; // روش خشن‌تراشی بیرونی
+  innerRoughMode: RoughMode; // روش خشن‌تراشی داخل؛ classic همان رفتار قبلی است
+  innerZoneOrder: number[]; // ترتیب نواحی شعاعی داخل
+  innerZoneBounds: number[]; // مرزهای شعاعی داخل (R)
+  ramp: boolean; // اتصال پیوسته بین مسیرهای خشن
+  safeBottomInnerLink: boolean; // اتصال مرحله‌ای امن کف‌تراشی به خشن داخل (بدون G0 — فرورفتن مستقیم برشی)
+  fastInnerBoundaryRouting?: boolean; // سازگاری تنظیم ذخیره‌شده نسخه قبلی
+  innerBoundaryRoutingMode?: "linear" | "expBinary" | "compact" | "orthogonal" | "nearest" | "rawBoundary" | "rdp" | "shortCode" | "offsetOptimized";
+  simpleFeed: boolean; // فیدر بهینه: همهٔ فیدرها به دو F اصلی (خشن/پرداخت) ساده شوند
+  zoneOrder: number[]; // ترتیب دستی نواحی (اندیس ناحیه‌ها) — آرایه خالی = ترتیب خودکار
+  zoneBounds: number[]; // مرزهای دستی داخلی نواحی (Z) — آرایه خالی = تقسیم خودکار
+  lineNumbers: boolean;
+  ops: Op[]; // زنجیره عملیات تراش (استراتژی)
+  format: CodeFormat; // سبک خروجی جی‌کد
+  spreadG0: boolean; // گسترش G0 در جی‌کد: حرکت‌های سریع روی‌هم با گام ۳mm فقط به سمت بیرون باز می‌شوند (فیدرها عوض نمی‌شوند)
+  split: SplitState; // نقطه تعیین‌کننده داخل/خارج (کاسه)
+  holder2: Holder2State; // آفست‌های قابل تنظیم هلدر دوم
+}
+
+/* ---------------- مشخصات مهندسی ابزار ---------------- */
+
+export type ToolType = "angle" | "round" | "groove";
+
+/** دستهٔ تراش اینسرت V 35° — زاویه‌های استاندارد */
+export type ToolHand = "center" | "left" | "right";
+
+export const HAND_INFO: Record<ToolHand, { name: string; desc: string; k: number }> = {
+  center: { name: "وسط‌تراش", desc: "متقارن — زاویه ۹۰°", k: 90 },
+  right: { name: "راست‌تراش", desc: "لبهٔ اصلی راست — ۸۷°", k: 87 },
+  left: { name: "چپ‌تراش", desc: "لبهٔ اصلی چپ — ۹۳°", k: 93 },
+};
+
+export interface ToolSpec {
+  type: ToolType;
+  hand: ToolHand; // دستهٔ تراش (فقط اینسرت V 35°)
+  angle: number; // زاویهٔ اینسرت — ثابت ۳۵ درجه
+  nose: number; // شعاع نوک اینسرت (mm)
+  size: number; // طول لبه اینسرت (mm)
+  radius: number; // شعاع اینسرت گرد (mm)
+  width: number; // پهنای تیغه شیارزن (mm)
+  corner: number; // شعاع گوشه شیارزن (mm)
+  shank: number; // پهنای دنباله (mm)
+}
+
+export const INSERT_ANGLE = 35; // زاویهٔ اینسرت V — ثابت
+
+export const DEFAULT_TOOL: ToolSpec = {
+  type: "angle",
+  hand: "center",
+  angle: INSERT_ANGLE,
+  nose: 0.2,
+  size: 16,
+  radius: 6,
+  width: 3,
+  corner: 0.2,
+  shank: 12,
+};
+
+/** شعاع‌های نوک استاندارد ISO */
+export const NOSE_RADII = [0.2, 0.4, 0.8, 1.2, 1.6];
+
+export function normalizeTool(raw: unknown, legacyW?: number): ToolSpec {
+  const base = { ...DEFAULT_TOOL };
+  if (raw && typeof raw === "object") {
+    const r = raw as Partial<ToolSpec>;
+    if (r.type === "angle" || r.type === "round" || r.type === "groove") base.type = r.type;
+    if (r.hand === "center" || r.hand === "left" || r.hand === "right") base.hand = r.hand;
+    const nums: (keyof ToolSpec)[] = ["angle", "nose", "size", "radius", "width", "corner", "shank"];
+    for (const k of nums) {
+      const v = r[k];
+      if (typeof v === "number" && Number.isFinite(v) && v >= 0) (base[k] as number) = v;
+    }
+    return base;
+  }
+  if (typeof legacyW === "number" && Number.isFinite(legacyW) && legacyW > 0) {
+    base.type = "groove";
+    base.width = legacyW;
+  }
+  return base;
+}
+
+/* پروفایل برشی ابزار: c(dz) = ارتفاع کف ابزار نسبت به نوک در فاصلهٔ محوری dz */
+export interface ToolProfile {
+  min: number;
+  max: number;
+  pts: [number, number][]; // [dz, c]
+  height: number; // ارتفاع اینسرت برای ترسیم
+}
+
+export function toolProfile(t: ToolSpec): ToolProfile {
+  const rad = (d: number) => (d * Math.PI) / 180;
+  const pts: [number, number][] = [];
+  let min = 0;
+  let max = 1;
+  let height = 6;
+  const step = 0.2;
+
+  if (t.type === "groove") {
+    const w = Math.max(0.5, t.width);
+    const rc = Math.min(Math.max(0, t.corner), w / 2);
+    min = -w / 2;
+    max = w / 2;
+    height = Math.max(4, w * 1.6);
+    void rad;
+    for (let dz = min; dz <= max + 1e-9; dz += step) {
+      const z = Math.min(max, dz);
+      const edge = w / 2 - rc;
+      const over = Math.abs(z) - edge;
+      const c = over > 0 ? rc - Math.sqrt(Math.max(0, rc * rc - over * over)) : 0;
+      pts.push([z, c]);
+    }
+    pts.push([max, pts[pts.length - 1][1]]);
+  } else if (t.type === "round") {
+    const R = Math.max(0.5, t.radius);
+    min = -R;
+    max = R;
+    height = R * 2;
+    for (let dz = -R; dz <= R + 1e-9; dz += step) {
+      const z = Math.min(R, dz);
+      pts.push([z, R - Math.sqrt(Math.max(0, R * R - z * z))]);
+    }
+    pts.push([R, R - Math.sqrt(Math.max(0, R * R - R * R))]);
+  } else {
+    /* اینسرت V 35° — زاویهٔ Included ثابت، جهت‌گیری بر اساس دستهٔ تراش      */
+    /* هندسهٔ دقیق: دو لبهٔ صاف + کمان نوک که بر هر دو لبه مماس است            */
+    const INC = INSERT_ANGLE;
+    const S = Math.max(3, t.size);
+    const Rn = Math.max(0, Math.min(t.nose, S / 4));
+    /* زاویهٔ لبهٔ چپ (aL) و راست (aR) نسبت به محور Z — aL−aR = ۳۵° */
+    let aL: number;
+    let aR: number;
+    if (t.hand === "center") {
+      aL = 90 + INC / 2; // ۱۰۷.۵°
+      aR = 90 - INC / 2; // ۷۲.۵°
+    } else if (t.hand === "right") {
+      aR = 87; // لبهٔ اصلی نزدیک قائم در سمت راست
+      aL = aR + INC; // لبهٔ فرعی ۵۸° به سمت چپ
+    } else {
+      aL = 93; // لبهٔ اصلی نزدیک قائم در سمت چپ
+      aR = aL - INC; // لبهٔ فرعی ۵۸° به سمت راست
+    }
+    const rL = rad(aL);
+    const rR = rad(aR);
+    const sL = Math.tan(rL); // منفی
+    const sR = Math.tan(rR); // مثبت
+    const lineC = (dz: number) => (dz < 0 ? dz * sL : dz * sR);
+
+    /* مرکز کمان نوک: هم‌فاصلهٔ Rn از هر دو لبه (درون V) */
+    let xc = 0;
+    let yc = Rn;
+    const det = Math.sin(rL - rR);
+    if (Rn > 0 && Math.abs(det) > 1e-9) {
+      xc = (Rn * (Math.cos(rR) + Math.cos(rL))) / det;
+      yc = (Rn * (Math.sin(rL) + Math.sin(rR))) / det;
+    }
+    const arcC = (dz: number): number => {
+      const dx = dz - xc;
+      if (Rn <= 0 || Math.abs(dx) > Rn) return -Infinity;
+      return yc - Math.sqrt(Rn * Rn - dx * dx);
+    };
+
+    min = S * Math.cos(rL);
+    max = S * Math.cos(rR);
+    height = Math.max(4, S * 0.95);
+    for (let dz = min; dz <= max + 1e-9; dz += step) {
+      const z = Math.min(max, dz);
+      pts.push([z, Math.max(lineC(z), arcC(z))]);
+    }
+    pts.push([max, Math.max(lineC(max), arcC(max))]);
+  }
+  /* تضمین نمونهٔ دقیق در نوک ابزار (dz = 0) */
+  if (pts.length >= 2 && pts[0][0] < -1e-9 && pts[pts.length - 1][0] > 1e-9) {
+    let k = 0;
+    while (k < pts.length - 1 && pts[k + 1][0] < 0) k++;
+    const [z1, c1] = pts[k];
+    const [z2, c2] = pts[k + 1];
+    const c0 = c1 + (c2 - c1) * ((0 - z1) / (z2 - z1));
+    pts.splice(k + 1, 0, [0, c0]);
+  }
+  return { min, max, pts, height };
+}
+
+export function toolDesc(t: ToolSpec): string {
+  if (t.type === "round") return `ROUND INSERT R${t.radius}`;
+  if (t.type === "groove") return `GROOVE TOOL W${t.width}`;
+  return `V${INSERT_ANGLE} ${HAND_INFO[t.hand].name.toUpperCase()} INSERT NOSE R${t.nose}`;
+}
+
+export type CodeFormat = "modal" | "std";
+
+export const RAPID_RATE = 2500; // mm/min
+
+let opUid = 1;
+
+/** گروه‌بندی عملیات برای انتخاب سریع «داخل / خارج / هردو» */
+export const OUTER_OPS: OpType[] = ["round", "face", "rough-d", "rough-z", "copy", "offset", "finish"];
+export const INNER_OPS: OpType[] = ["inner-rough", "inner-offset", "inner-finish", "bottom"];
+
+/** هلدر پیش‌فرض هر عملیات: داخل‌تراشی با هلدر دوم، بقیه با هلدر اول */
+export const DEFAULT_HOLDER: Record<OpType, 1 | 2> = {
+  round: 1,
+  face: 1,
+  "rough-d": 1,
+  "rough-z": 1,
+  copy: 1,
+  offset: 1,
+  finish: 1,
+  "inner-rough": 2,
+  "inner-offset": 2,
+  "inner-finish": 2,
+  bottom: 2,
+};
+
+export const DEFAULT_PARAMS: Params = {
+  blankD: 60,
+  blankL: 200,
+  blankShape: "square",
+  doc: 3,
+  innerDoc: 3,
+  offsetDist: 0.5,
+  innerOffsetDist: 0.5,
+  innerStartClearance: 2,
+  innerEndTravel: 300,
+  bottomRoughOverlap: 3,
+  bottomOffsetClearance: 0,
+  extraCutEachSide: 2,
+  gcodeShiftX: 0,
+  gcodeShiftY: 0,
+  smartTransferEnabled: false,
+  smartTransferAngleMin: 20,
+  smartTransferAngleMax: 80,
+  feedRough: 220,
+  feedFinish: 110,
+  rpm: 1500,
+  tool: { ...DEFAULT_TOOL },
+  safety: 2,
+  roughMode: "zone",
+  innerRoughMode: "classic",
+  innerZoneOrder: [],
+  innerZoneBounds: [],
+  ramp: true,
+  safeBottomInnerLink: true,
+  simpleFeed: true,
+  zoneOrder: [],
+  zoneBounds: [],
+  lineNumbers: true,
+  ops: makeOps(["round", "rough-d", "offset", "finish"]),
+  format: "modal",
+  spreadG0: false,
+  split: { ...DEFAULT_SPLIT },
+  holder2: { ...DEFAULT_HOLDER2 },
+};
+
+/* نرمال‌سازی پارامترهای ذخیره‌شده (سازگاری با نسخه‌های قبل) */
+export function normalizeParams(
+  raw: (Partial<Params> & { facing?: boolean; spring?: boolean; toolW?: number; finAllow?: number; zigzag?: boolean }) | undefined,
+  legacy = false
+): Params {
+  const base: Params = {
+    ...DEFAULT_PARAMS,
+    ops: makeOps(STRATEGIES[0].types),
+    tool: { ...DEFAULT_TOOL },
+    split: { ...DEFAULT_SPLIT },
+    holder2: { ...DEFAULT_HOLDER2 },
+  };
+  if (!raw) return base;
+  const keys: (keyof Params)[] = ["blankD", "blankL", "doc", "innerDoc", "offsetDist", "innerOffsetDist", "innerStartClearance", "innerEndTravel", "bottomRoughOverlap", "bottomOffsetClearance", "extraCutEachSide", "gcodeShiftX", "gcodeShiftY", "smartTransferEnabled", "smartTransferAngleMin", "smartTransferAngleMax", "feedRough", "feedFinish", "rpm", "safety", "lineNumbers", "ramp", "safeBottomInnerLink", "simpleFeed", "spreadG0"];
+  for (const k of keys) {
+    const v = raw[k];
+    if (typeof v === "number" && Number.isFinite(v)) (base[k] as number) = v as number;
+    else if (typeof v === "boolean") (base[k] as boolean) = v as boolean;
+  }
+  /* پروژه‌های قدیمی پارامتر مستقل داخل‌تراشی نداشتند؛ مقدار قبلی عمق بار
+     نقطه شروع سازگار و قابل‌پیش‌بینی برای آن‌هاست. */
+  if (!(typeof raw.innerDoc === "number" && Number.isFinite(raw.innerDoc)) && typeof raw.doc === "number" && Number.isFinite(raw.doc)) {
+    base.innerDoc = raw.doc;
+  }
+  base.innerDoc = Math.min(10, Math.max(0.5, base.innerDoc));
+  base.innerStartClearance = Math.min(MAX_INNER_DISTANCE, Math.max(MIN_INNER_DISTANCE, base.innerStartClearance));
+  base.innerEndTravel = Math.min(MAX_INNER_DISTANCE, Math.max(MIN_INNER_DISTANCE, base.innerEndTravel));
+  base.bottomRoughOverlap = Math.min(50, Math.max(0, base.bottomRoughOverlap));
+  base.bottomOffsetClearance = Math.min(100, Math.max(0, base.bottomOffsetClearance));
+  base.extraCutEachSide = Math.min(10, Math.max(0, base.extraCutEachSide));
+  base.smartTransferAngleMin = Math.min(90, Math.max(0, base.smartTransferAngleMin));
+  base.smartTransferAngleMax = Math.min(90, Math.max(0, base.smartTransferAngleMax));
+  /* مهاجرت «اضافه پرداخت» قدیمی به «فاصله آفست» */
+  if (typeof raw.finAllow === "number" && Number.isFinite(raw.finAllow)) base.offsetDist = raw.finAllow;
+  /* روش خشن‌تراشی + مهاجرت سوئیچ زیگزاگ قدیمی */
+  if (raw.roughMode === "classic" || raw.roughMode === "zigzag" || raw.roughMode === "zone") base.roughMode = raw.roughMode;
+  else if (typeof raw.zigzag === "boolean") base.roughMode = raw.zigzag ? "zigzag" : "classic";
+  if (raw.innerRoughMode === "classic" || raw.innerRoughMode === "zigzag" || raw.innerRoughMode === "zone") base.innerRoughMode = raw.innerRoughMode;
+  /* شکل مقطع خام */
+  if (raw.blankShape === "circle" || raw.blankShape === "square" || raw.blankShape === "hex" || raw.blankShape === "octagon") {
+    base.blankShape = raw.blankShape;
+  }
+  /* ترتیب دستی نواحی — فقط آرایه‌ای از اعداد معتبر پذیرفته می‌شود */
+  if (Array.isArray(raw.zoneOrder) && raw.zoneOrder.every((v) => typeof v === "number" && Number.isInteger(v) && v >= 0)) {
+    base.zoneOrder = [...raw.zoneOrder];
+  }
+  /* مرزهای دستی نواحی — مرتب، داخل قطعه و متمایز */
+  if (Array.isArray(raw.zoneBounds) && raw.zoneBounds.every((v) => typeof v === "number" && Number.isFinite(v))) {
+    base.zoneBounds = [...raw.zoneBounds].sort((a, b) => a - b);
+  }
+  if (Array.isArray(raw.innerZoneOrder) && raw.innerZoneOrder.every((v) => typeof v === "number" && Number.isInteger(v) && v >= 0)) base.innerZoneOrder = [...raw.innerZoneOrder];
+  if (Array.isArray(raw.innerZoneBounds) && raw.innerZoneBounds.every((v) => typeof v === "number" && Number.isFinite(v))) base.innerZoneBounds = [...raw.innerZoneBounds].sort((a,b)=>a-b);
+  const ops = normalizeOps(raw.ops, legacy);
+  if (ops) base.ops = ops;
+  if (raw.format === "modal" || raw.format === "std") base.format = raw.format;
+  /* نقطه Split و هلدر دوم */
+  if (raw.split && typeof raw.split === "object") {
+    const s = raw.split as Partial<SplitState>;
+    if (typeof s.enabled === "boolean") base.split.enabled = s.enabled;
+    if (typeof s.z === "number" && Number.isFinite(s.z)) base.split.z = s.z;
+    if (typeof s.r === "number" && Number.isFinite(s.r)) base.split.r = s.r;
+    if (typeof s.swapped === "boolean") base.split.swapped = s.swapped;
+  }
+  if (raw.holder2 && typeof raw.holder2 === "object") {
+    const h = raw.holder2 as Partial<Holder2State>;
+    if (typeof h.xOff === "number" && Number.isFinite(h.xOff)) base.holder2.xOff = Math.max(MIN_HOLDER2_OFFSET, h.xOff);
+    if (typeof h.yOff === "number" && Number.isFinite(h.yOff)) base.holder2.yOff = Math.max(MIN_HOLDER2_OFFSET, h.yOff);
+  }
+  base.tool = normalizeTool(raw.tool, raw.toolW);
+  return base;
+}
+
+export interface Sample {
+  z: number;
+  r: number;
+}
+
+/* تراکم‌بخشی یکنواخت پاره‌خط‌های مستقیم پس از محاسبهٔ آفست و حذف حلقه‌ها
+   تا گام نمونه‌ها حداکثر maxStep بماند و الگوریتم‌های وابسته به نمونهٔ میانی
+   (مانند انتقال هوشمند خطوط مستقیم) رفتار دقیق خود را حفظ کنند. */
+function densifyPolyline(pts: Sample[], maxStep = 1.2): Sample[] {
+  if (pts.length <= 1) return pts.map((p) => ({ ...p }));
+  const out: Sample[] = [{ ...pts[0] }];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const len = Math.hypot(b.z - a.z, b.r - a.r);
+    if (len <= 1e-9) continue;
+    const steps = Math.max(1, Math.ceil(len / maxStep));
+    for (let k = 1; k <= steps; k++) {
+      const t = k / steps;
+      out.push(k === steps ? { ...b } : { z: a.z + (b.z - a.z) * t, r: a.r + (b.r - a.r) * t });
+    }
+  }
+  return out;
+}
+
+/* آفست موازی دقیق پاره‌خط‌به‌پاره‌خط: هر ضلع زنجیره در جهت نرمال واقعی به اندازهٔ dist
+   جابه‌جا شده و در گوشه‌ها با تقاطع دقیق خطوط موازی (Miter/Bevel) بسته می‌شود تا خطوط
+   قائم (+۹۰° و −۹۰°)، داخل شیارهای Uشکل و پله‌های عمودی کاملاً دقیق و بدون پخ یا حلقهٔ
+   برگشتی شناسایی شوند. */
+export function normalOffset(pts: Sample[], dist: number, outward: boolean): Sample[] {
+  const deduped = pts.filter((p, i) => i === 0 || Math.hypot(p.z - pts[i - 1].z, p.r - pts[i - 1].r) > 1e-9);
+  if (deduped.length === 0) return [];
+  if (deduped.length === 1 || Math.abs(dist) < 1e-12) return deduped.map((s) => ({ z: s.z, r: s.r }));
+
+  const clean = compactExactlyCollinear(deduped);
+  const n = clean.length;
+  if (n < 2) return deduped.map((s) => ({ z: s.z, r: s.r }));
+
+  /* در زنجیرهٔ چپ‌به‌راست (dz>=0)، سمت چپ بردار مماس (-tr, +tz) رو به بیرون قطعه (+R) است.
+     اگر کل زنجیره عمودی باشد (dz≈0)، بالا به پایین (dr<0) بیرونش سمت +Z (سمت چپ بردار) است. */
+  const totalDz = clean[n - 1].z - clean[0].z;
+  const totalDr = clean[n - 1].r - clean[0].r;
+  const leftIsOutward = Math.abs(totalDz) > 1e-6 ? totalDz > 0 : totalDr <= 0;
+  const sign = (outward === leftIsOutward ? 1 : -1) * Math.sign(dist);
+  const dAbs = Math.abs(dist);
+
+  const segments = Array.from({ length: n - 1 }, (_, i) => {
+    const a = clean[i], b = clean[i + 1];
+    const length = Math.hypot(b.z - a.z, b.r - a.r);
+    const tz = (b.z - a.z) / length, tr = (b.r - a.r) / length;
+    const nz = -tr * sign, nr = tz * sign;
+    return {
+      tz,
+      tr,
+      length,
+      a: { z: a.z + nz * dAbs, r: a.r + nr * dAbs },
+      b: { z: b.z + nz * dAbs, r: b.r + nr * dAbs },
+    };
+  });
+
+  const out: Sample[] = [{ ...segments[0].a }];
+  for (let i = 1; i < n - 1; i++) {
+    const prev = segments[i - 1], next = segments[i];
+    const cross = prev.tz * next.tr - prev.tr * next.tz;
+    let joined: Sample | null = null;
+    if (Math.abs(cross) >= 1e-8) {
+      const qz = next.a.z - prev.a.z, qr = next.a.r - prev.a.r;
+      const t = (qz * next.tr - qr * next.tz) / cross;
+      const candidate = { z: prev.a.z + prev.tz * t, r: prev.a.r + prev.tr * t };
+      const miter = Math.hypot(candidate.z - clean[i].z, candidate.r - clean[i].r);
+      /* در گوشه‌های محدب بیرونی نسبت ۲٫۵ اسپایک‌های سوزنی را مهار می‌کند (گوشهٔ ۹۰° برابر ۱٫۴۱۴ است)؛
+         در گوشه‌های مقعر داخلی (کف شیار U یا V) تقاطع واقعی دو دیواره تا زاویه‌های تند حفظ می‌شود. */
+      const isConcave = cross * sign > 0;
+      const maxMiter = Math.max(0.05, dAbs * (isConcave ? 20 : 2.5));
+      if (Number.isFinite(miter) && miter <= maxMiter) joined = candidate;
+    }
+    if (joined) out.push(joined);
+    else {
+      out.push({ ...prev.b });
+      if (Math.hypot(next.a.z - prev.b.z, next.a.r - prev.b.r) > 1e-9) out.push({ ...next.a });
+    }
+  }
+  out.push({ ...segments[segments.length - 1].b });
+
+  const clamped = outward
+    ? out.map((p) => ({ z: p.z, r: Math.max(0, p.r) }))
+    : out;
+  const trimmed = trimOffsetLoops(clamped);
+  return densifyPolyline(trimmed, 1.2);
+}
+
+/**
+ * تشخیص خودکار سمت داخل حفره (به طرف محور R=0 و دهانهٔ باز +Z) برای شاخهٔ داخلی
+ * که از نقطهٔ Split آغاز و به انتهای داخلی ختم شده است، تا آفست داخل هرگز به
+ * درون گوشت قطعه نیفتد.
+ */
+export function innerOffsetLeftSide(pts: Sample[]): boolean {
+  const clean = pts.filter((point, i) => i === 0 || Math.hypot(point.z - pts[i - 1].z, point.r - pts[i - 1].r) > 1e-9);
+  if (clean.length < 2) return true;
+  const splitEnd = clean[0];
+  const floorEnd = clean[clean.length - 1];
+  let maxZ = -Infinity;
+  for (const q of clean) if (q.z > maxZ) maxZ = q.z;
+  const mouthZ = maxZ + 10;
+  const cavityLoop: Sample[] = [
+    ...clean,
+    { z: floorEnd.z, r: 0 },
+    { z: mouthZ, r: 0 },
+    { z: mouthZ, r: splitEnd.r },
+  ];
+  let area2 = 0;
+  for (let i = 0; i < cavityLoop.length; i++) {
+    const a = cavityLoop[i];
+    const b = cavityLoop[(i + 1) % cavityLoop.length];
+    area2 += a.z * b.r - b.z * a.r;
+  }
+  return area2 >= -1e-6;
+}
+
+/* آفست یک سمتِ پیوسته برای مسیرهای برگشتی/Overhang. برخلاف normalOffset، با
+   عبور مماس از قله علامت نرمال را براساس مؤلفه شعاعی عوض نمی‌کند؛ سمت چپ مسیر
+   در تمام زنجیره ثابت می‌ماند و بنابراین Offset ناگهان به داخل منحنی نمی‌پرد. */
+export function continuousPathOffset(pts: Sample[], dist: number, leftSide = true): Sample[] {
+  const deduped = pts.filter((point, i) => i === 0 || Math.hypot(point.z - pts[i - 1].z, point.r - pts[i - 1].r) > 1e-9);
+  if (deduped.length < 2 || dist === 0) return deduped.map((point) => ({ ...point }));
+  const clean = compactExactlyCollinear(deduped);
+  const n = clean.length;
+  if (n < 2) return deduped.map((point) => ({ ...point }));
+  const sign = leftSide ? 1 : -1;
+  const segments = Array.from({ length: n - 1 }, (_, i) => {
+    const a = clean[i], b = clean[i + 1];
+    const length = Math.hypot(b.z - a.z, b.r - a.r);
+    const tz = (b.z - a.z) / length, tr = (b.r - a.r) / length;
+    const nz = -tr * sign, nr = tz * sign;
+    return {
+      tz, tr,
+      a: { z: a.z + nz * dist, r: a.r + nr * dist },
+      b: { z: b.z + nz * dist, r: b.r + nr * dist },
+    };
+  });
+  const out: Sample[] = [{ ...segments[0].a }];
+  for (let i = 1; i < n - 1; i++) {
+    const prev = segments[i - 1], next = segments[i];
+    const cross = prev.tz * next.tr - prev.tr * next.tz;
+    let joined: Sample | null = null;
+    if (Math.abs(cross) >= 1e-8) {
+      const qz = next.a.z - prev.a.z, qr = next.a.r - prev.a.r;
+      const t = (qz * next.tr - qr * next.tz) / cross;
+      const candidate = { z: prev.a.z + prev.tz * t, r: prev.a.r + prev.tr * t };
+      const miter = Math.hypot(candidate.z - clean[i].z, candidate.r - clean[i].r);
+      const isConcave = cross * sign > 0;
+      const maxMiter = Math.max(0.05, Math.abs(dist) * (isConcave ? 20 : 2.5));
+      if (Number.isFinite(miter) && miter <= maxMiter) joined = candidate;
+    }
+    if (joined) out.push(joined);
+    else {
+      /* Bevel: هر دو انتهای واقعی خطوط موازی حفظ می‌شوند، نه میانگینی که دیگر
+         در فاصله ثابت از اضلاع نیست و در زاویه بسته رفت‌وبرگشت ایجاد می‌کند. */
+      out.push({ ...prev.b });
+      if (Math.hypot(next.a.z - prev.b.z, next.a.r - prev.b.r) > 1e-9) out.push({ ...next.a });
+    }
+  }
+  out.push({ ...segments[segments.length - 1].b });
+
+  /* مسیر داخلی از لبه به کف می‌رود. اگر آفست در انتهای کف از محور عبور کند،
+     دقیقاً در تقاطع R=0 بریده می‌شود و هیچ بخش منفی یا امتداد روی محور ساخته نمی‌شود. */
+  const clipped: Sample[] = [];
+  for (let i = 0; i < out.length; i++) {
+    const point = out[i];
+    if (point.r >= -1e-9) {
+      clipped.push({ z: point.z, r: Math.max(0, point.r) });
+      continue;
+    }
+    if (clipped.length && i > 0) {
+      const prev = out[i - 1];
+      const t = prev.r / Math.max(1e-12, prev.r - point.r);
+      clipped.push({ z: prev.z + (point.z - prev.z) * t, r: 0 });
+    }
+    break;
+  }
+  let result = clipped.length >= 2 ? clipped : out.map((point) => ({ z: point.z, r: Math.max(0, point.r) }));
+  /* Bevel جلوی اسپایک محلی را می‌گیرد و این مرحله هر خودتقاطع باقی‌مانده میان
+     اضلاع غیرمجاور (در زیگزاگ‌های بسیار نزدیک) را حذف می‌کند. */
+  result = trimOffsetLoops(result);
+
+  /* حتی اگر آفست هندسی پیش از محور تمام شود، انتهای مسیر باید دقیقاً به R=0
+     بچسبد. امتداد در جهت ضلع آخر انجام می‌شود؛ اگر ضلع از محور دور شود، اتصال
+     کوتاه شعاعی در همان X ساخته می‌شود. */
+  const last = result[result.length - 1];
+  if (last && last.r > 1e-9) {
+    const prev = result[result.length - 2];
+    if (prev && last.r < prev.r - 1e-9) {
+      const t = last.r / (prev.r - last.r);
+      result.push({ z: last.z + (last.z - prev.z) * t, r: 0 });
+    } else {
+      result.push({ z: last.z, r: 0 });
+    }
+  } else if (last) last.r = 0;
+  return densifyPolyline(result, 1.2);
+}
+
+/* تقاطع یا برخورد دو پاره‌خط غیرمجاور (شامل برخورد سرِ پاره‌خط و هم‌پوشانی هم‌خط در شیارهای باریک‌تر از ۲×آفست) */
+function segCross(p1: Sample, p2: Sample, p3: Sample, p4: Sample, adjacentByTwo = false): Sample | null {
+  const dz1 = p2.z - p1.z, dr1 = p2.r - p1.r, dz2 = p4.z - p3.z, dr2 = p4.r - p3.r;
+  const len1Sq = dz1 * dz1 + dr1 * dr1, len2Sq = dz2 * dz2 + dr2 * dr2;
+  if (len1Sq < 1e-16 || len2Sq < 1e-16) return null;
+  const scale = Math.sqrt(len1Sq * len2Sq);
+  const d = dz1 * dr2 - dr1 * dz2;
+  if (Math.abs(d) <= 1e-10 * scale) {
+    const perp = Math.abs((p3.z - p1.z) * dr1 - (p3.r - p1.r) * dz1) / Math.sqrt(len1Sq);
+    if (perp > 1e-6) return null;
+    const tb1 = ((p3.z - p1.z) * dz1 + (p3.r - p1.r) * dr1) / len1Sq;
+    const tb2 = ((p4.z - p1.z) * dz1 + (p4.r - p1.r) * dr1) / len1Sq;
+    const lo = Math.min(tb1, tb2), hi = Math.max(tb1, tb2);
+    if (hi < 1e-6 || lo > 1 - 1e-6) return null;
+    const tc = Math.max(0, Math.min(1, tb1));
+    return { z: p1.z + tc * dz1, r: p1.r + tc * dr1 };
+  }
+  const t = ((p3.z - p1.z) * dr2 - (p3.r - p1.r) * dz2) / d;
+  const u = ((p3.z - p1.z) * dr1 - (p3.r - p1.r) * dz1) / d;
+  if (t >= -1e-6 && t <= 1 + 1e-6 && u >= -1e-6 && u <= 1 + 1e-6) {
+    if (adjacentByTwo && t > 1 - 1e-5 && u < 1e-5 && Math.hypot(p2.z - p3.z, p2.r - p3.r) < 1e-5) {
+      return null;
+    }
+    const tc = Math.max(0, Math.min(1, t));
+    return { z: p1.z + tc * dz1, r: p1.r + tc * dr1 };
+  }
+  return null;
+}
+
+/* حذف حلقه‌های خودتقاطعی آفست در کنج‌های مقعر و شیارهای باریک: هر جا دو پاره غیرمجاور
+   هم را قطع کنند یا روی هم برگردند، حلقه بین‌شان بریده و نقطه تقاطع جایگزین می‌شود. */
+function trimOffsetLoops(pts: Sample[]): Sample[] {
+  const dedup = (arr: Sample[]): Sample[] =>
+    arr.filter((p, idx) => idx === 0 || Math.hypot(p.z - arr[idx - 1].z, p.r - arr[idx - 1].r) > 1e-8);
+  let cur = dedup(pts);
+  const maxPasses = Math.max(16, cur.length * 2);
+  for (let pass = 0; pass < maxPasses; pass++) {
+    let cut = false;
+    for (let i = 0; i < cur.length - 1 && !cut; i++) {
+      const a1 = cur[i], a2 = cur[i + 1];
+      const az0 = Math.min(a1.z, a2.z), az1 = Math.max(a1.z, a2.z);
+      const ar0 = Math.min(a1.r, a2.r), ar1 = Math.max(a1.r, a2.r);
+      for (let j = i + 2; j < cur.length - 1; j++) {
+        const b1 = cur[j], b2 = cur[j + 1];
+        if (Math.min(b1.z, b2.z) > az1 + 1e-6 || Math.max(b1.z, b2.z) < az0 - 1e-6) continue;
+        if (Math.min(b1.r, b2.r) > ar1 + 1e-6 || Math.max(b1.r, b2.r) < ar0 - 1e-6) continue;
+        const P = segCross(a1, a2, b1, b2, j === i + 2);
+        if (P) {
+          cur = dedup([...cur.slice(0, i + 1), P, ...cur.slice(j + 1)]);
+          cut = true;
+          break;
+        }
+      }
+    }
+    if (!cut) return cur;
+  }
+  return cur;
+}
+
+export type SegKind = "rapid" | "round" | "face" | "rough" | "roughz" | "copy" | "offset" | "finish" | "bore" | "boreoff" | "borefin" | "bottom";
+
+/* ---------------- جبران شعاع و هندسه ابزار (منطق cnc-simulato.html) ---------------- */
+
+export type ToolCompMachine = "mill" | "turn"; // mill = مرکز ابزار XY ، turn = نوک ابزار XY
+export type ToolCompMode = "G41" | "G42" | "G40";
+export type ToolCompShape = "round" | "sharp" | "flat";
+
+export interface OpToolComp {
+  enabled: boolean;
+  machine: ToolCompMachine;
+  mode: ToolCompMode;
+  shape: ToolCompShape;
+  radius: number;
+  diamondWidth: number;
+  width: number;
+  rl: number;
+  rr: number;
+  angle: number;
+  direction: 1 | -1;
+}
+
+export const DEFAULT_OP_TOOL_COMP: OpToolComp = {
+  enabled: false,
+  machine: "turn",
+  mode: "G41",
+  shape: "round",
+  radius: 1.5,
+  diamondWidth: 6.3,
+  width: 8,
+  rl: 1.2,
+  rr: 1.2,
+  angle: 0,
+  direction: 1,
+};
+
+/** بیشترین شعاع مجاز نوک برای اینسرت لوزی ۳۵ درجه با عرض مشخص تا اضلاع لوزی حفظ شوند */
+export function diamondMaxRadius(width: number): number {
+  const half = (17.5 * Math.PI) / 180;
+  return Math.max(0.1, Math.floor(((width / 2 / Math.cos(half)) * 0.72) * 100 + 1e-8) / 100);
+}
+
+export function normalizeOpToolComp(raw: unknown): OpToolComp | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const machine: ToolCompMachine = r.machine === "mill" ? "mill" : "turn";
+  const mode: ToolCompMode = r.mode === "G42" ? "G42" : r.mode === "G40" ? "G40" : "G41";
+  const shape: ToolCompShape =
+    r.shape === "sharp" ? "sharp" : r.shape === "flat" && machine === "turn" ? "flat" : "round";
+  const diamondWidth = Math.max(2, Math.min(35, typeof r.diamondWidth === "number" && Number.isFinite(r.diamondWidth) ? r.diamondWidth : DEFAULT_OP_TOOL_COMP.diamondWidth));
+  const maxD = diamondMaxRadius(diamondWidth);
+  const rawRadius = typeof r.radius === "number" && Number.isFinite(r.radius) ? r.radius : DEFAULT_OP_TOOL_COMP.radius;
+  const minR = shape === "sharp" ? 0 : machine === "mill" ? 0 : 0.2;
+  const maxR = shape === "sharp" ? maxD : 12;
+  const radius = Math.max(minR, Math.min(maxR, rawRadius));
+  const width = Math.max(2, Math.min(20, typeof r.width === "number" && Number.isFinite(r.width) ? r.width : DEFAULT_OP_TOOL_COMP.width));
+  let rl = Math.max(0, Math.min(8, typeof r.rl === "number" && Number.isFinite(r.rl) ? r.rl : DEFAULT_OP_TOOL_COMP.rl));
+  let rr = Math.max(0, Math.min(8, typeof r.rr === "number" && Number.isFinite(r.rr) ? r.rr : DEFAULT_OP_TOOL_COMP.rr));
+  if (rl + rr > width) {
+    const scale = width / Math.max(1e-6, rl + rr);
+    rl = +(rl * scale).toFixed(2);
+    rr = Math.max(0, +(width - rl).toFixed(2));
+  }
+  const angle = Math.max(-180, Math.min(180, typeof r.angle === "number" && Number.isFinite(r.angle) ? r.angle : 0));
+  const direction: 1 | -1 = r.direction === -1 ? -1 : 1;
+  return {
+    enabled: r.enabled === true,
+    machine,
+    mode,
+    shape,
+    radius,
+    diamondWidth,
+    width,
+    rl,
+    rr,
+    angle,
+    direction,
+  };
+}
+
+function compRot(v: [number, number], deg: number): [number, number] {
+  const a = (deg * Math.PI) / 180;
+  const c = Math.cos(a), s = Math.sin(a);
+  return [v[0] * c - v[1] * s, v[0] * s + v[1] * c];
+}
+
+function compArcPts(cx: number, cy: number, r: number, a0: number, a1: number, n = 22): [number, number][] {
+  if (r <= 1e-6) return [[cx, cy]];
+  const out: [number, number][] = [];
+  for (let i = 0; i <= n; i++) {
+    const t = a0 + ((a1 - a0) * i) / n;
+    out.push([cx + Math.cos(t) * r, cy + Math.sin(t) * r]);
+  }
+  return out;
+}
+
+/**
+ * ساخت چندضلعی مقطع مؤثر برشی ابزار نسبت به نقطه مرجع (0,0)
+ * منطبق بر تابع makeShape در فایل cnc-simulato.html:
+ * مختصات خروجی [zOffset, rOffset] است که با [x, y] در فایل اچ‌تی‌ام‌ال و خروجی جی‌کد X/Y یکی است.
+ */
+export function makeCompToolShape(comp: OpToolComp): [number, number][] {
+  const R = comp.radius;
+  let pts: [number, number][] = [];
+  if (comp.machine === "mill" && comp.shape === "round") {
+    pts = compArcPts(0, 0, R, 0, Math.PI * 2, 72);
+  } else if (comp.shape === "round") {
+    pts = compArcPts(0, R, R, -Math.PI / 2, Math.PI * 1.5, 72);
+  } else if (comp.shape === "sharp") {
+    /* فرمول دقیق لوزی ۳۵ درجه (۴ ضلع لوزی + دو نوک گرد بالا و پایین) منطبق بر makeShape در cnc-simulato.html */
+    const ang = (17.5 * Math.PI) / 180;
+    const w = comp.diamondWidth / 2;
+    const h = w / Math.tan(ang);
+    const r = Math.max(0, Math.min(R, diamondMaxRadius(comp.diamondWidth)));
+    if (r <= 1e-6) {
+      const shift = comp.machine === "mill" ? h : 0;
+      pts = [
+        [0, -shift],
+        [w, h - shift],
+        [0, 2 * h - shift],
+        [-w, h - shift],
+      ];
+    } else {
+      const cy = r / Math.sin(ang);
+      const shift = comp.machine === "mill" ? cy : cy - r;
+      const low1 = compArcPts(0, cy, r, Math.PI + ang, 1.5 * Math.PI, 18);
+      const low2 = compArcPts(0, cy, r, 1.5 * Math.PI, 2 * Math.PI - ang, 18).slice(1);
+      const up1 = compArcPts(0, 2 * h - cy, r, ang, Math.PI / 2, 18);
+      const up2 = compArcPts(0, 2 * h - cy, r, Math.PI / 2, Math.PI - ang, 18).slice(1);
+      pts = [
+        ...low1,
+        ...low2,
+        [w, h] as [number, number],
+        ...up1,
+        ...up2,
+        [-w, h] as [number, number],
+      ].map(([x, y]) => [x, y - shift]);
+    }
+  } else {
+    const w = comp.width;
+    const rl = Math.min(comp.rl, w * 0.48);
+    const rr = Math.min(comp.rr, w - rl - 0.05);
+    const h = 8;
+    const leftX = -w / 2;
+    const rightX = w / 2;
+    pts = [
+      [leftX, h],
+      ...compArcPts(leftX + rl, rl, rl, Math.PI, Math.PI * 1.5, 22),
+      ...compArcPts(rightX - rr, rr, rr, -Math.PI / 2, 0, 22),
+      [rightX, h],
+    ];
+  }
+  return pts.map((p) => compRot(p, comp.angle));
+}
+
+/** تابع پشتیبان هندسی (Support Mapping) منطبق بر cnc-simulato.html */
+export function compSupport(dir: [number, number], shape: [number, number][]): [number, number] {
+  let best: [number, number] = shape[0] || [0, 0];
+  let max = -Infinity;
+  for (const p of shape) {
+    const v = p[0] * dir[0] + p[1] * dir[1];
+    if (v > max) {
+      max = v;
+      best = p;
+    }
+  }
+  return best;
+}
+
+/** نقطه تماس جبران شعاع روی ابزار نسبت به مرجع ابزار (منطبق بر compensationContact در cnc-simulato.html) */
+export function compContactPoint(
+  n: [number, number],
+  comp: Pick<OpToolComp, "mode" | "direction">,
+  shape: [number, number][]
+): [number, number] {
+  if (comp.mode === "G40") return [0, 0];
+  const geomSign = (comp.mode === "G41" ? 1 : -1) * comp.direction;
+  const d: [number, number] = geomSign > 0 ? [-n[0], -n[1]] : [n[0], n[1]];
+  return compSupport(d, shape);
+}
+
+/** پوش محدب (Convex Hull - Andrew's Monotone Chain) منطبق بر تابع hull در cnc-simulato.html */
+export function compHull(points: [number, number][]): [number, number][] {
+  const pts = points
+    .slice()
+    .sort((a, b) => (Math.abs(a[0] - b[0]) > 1e-9 ? a[0] - b[0] : a[1] - b[1]));
+  if (pts.length <= 2) return pts;
+  const cross = (o: [number, number], a: [number, number], b: [number, number]) =>
+    (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lower: [number, number][] = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper: [number, number][] = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+/**
+ * آفست پیوسته و کامل مبتنی بر تابع پشتیبان ابزار (compContactPoint):
+ * - پوشش صددرصدی از ابتدای اولین قطعه تا انتهای آخرین قطعه (یا نقطه اسپیلیت) بدون کوتاه‌شدگی دو سر
+ * - چرخش دقیق حول گوشه‌های محدب و تقاطع/حذف حلقه‌های خودتقاطعی در کنج‌های مقعر و شیارها
+ */
+export function continuousToolOffset(
+  pts: Sample[],
+  comp: OpToolComp,
+  shape: [number, number][],
+  leftSide = true,
+  clipToAxis = false,
+  clampMinR = 0
+): Sample[] {
+  const deduped = pts.filter((point, i) => i === 0 || Math.hypot(point.z - pts[i - 1].z, point.r - pts[i - 1].r) > 1e-9);
+  if (deduped.length < 2 || !comp.enabled || comp.mode === "G40" || shape.length === 0) {
+    return deduped.map((point) => ({ ...point }));
+  }
+  const clean = compactExactlyCollinear(deduped);
+  const n = clean.length;
+  if (n < 2) return deduped.map((point) => ({ ...point }));
+  const sign = leftSide ? 1 : -1;
+
+  let maxToolSpan = 1;
+  for (const v of shape) {
+    const d = Math.hypot(v[0], v[1]);
+    if (d > maxToolSpan) maxToolSpan = d;
+  }
+
+  const segments = Array.from({ length: n - 1 }, (_, i) => {
+    const a = clean[i], b = clean[i + 1];
+    const length = Math.hypot(b.z - a.z, b.r - a.r) || 1;
+    const tz = (b.z - a.z) / length, tr = (b.r - a.r) / length;
+    const nz = -tr * sign, nr = tz * sign;
+    const c = compContactPoint([nz, nr], comp, shape);
+    return {
+      len: length,
+      tz, tr, nz, nr,
+      a: { z: a.z - c[0], r: a.r - c[1] },
+      b: { z: b.z - c[0], r: b.r - c[1] },
+    };
+  });
+
+  const geomSign = (comp.mode === "G41" ? 1 : -1) * comp.direction;
+  const out: Sample[] = [];
+
+  /* تضمین شروع از ابتدای واقعی خط در پروفیل بیرونی: اگر قطعه اول شیب رو به پایین داشته باشد
+     به‌طوری که نقطه تماس اولیه جلوتر از ابتدای خط بیفتد، ابزار از بالای نقطه شروع حول سر خط می‌چرخد */
+  if (!clipToAxis && segments[0].nz * geomSign > 1e-4 && segments[0].nr * sign >= -1e-4) {
+    const startN: [number, number] = [0, sign];
+    const ang1 = Math.atan2(startN[1], startN[0]);
+    const ang2 = Math.atan2(segments[0].nr, segments[0].nz);
+    let dAng = ang2 - ang1;
+    while (dAng <= -Math.PI) dAng += Math.PI * 2;
+    while (dAng > Math.PI) dAng -= Math.PI * 2;
+    const steps = Math.max(1, Math.min(16, Math.ceil(Math.abs(dAng) / ((8 * Math.PI) / 180))));
+    for (let s = 0; s < steps; s++) {
+      const a = ang1 + (dAng * s) / steps;
+      const c = compContactPoint([Math.cos(a), Math.sin(a)], comp, shape);
+      const pt = { z: clean[0].z - c[0], r: clean[0].r - c[1] };
+      if (!out.length || Math.hypot(pt.z - out[out.length - 1].z, pt.r - out[out.length - 1].r) > 1e-8) {
+        out.push(pt);
+      }
+    }
+  }
+
+  out.push({ ...segments[0].a });
+
+  for (let i = 1; i < n - 1; i++) {
+    const prev = segments[i - 1], next = segments[i];
+    const cross = prev.tz * next.tr - prev.tr * next.tz;
+    /* تشخیص گوشه محدب در سمت جبران (جایی که ابزار به دور گوشه می‌چرخد) */
+    const isConvexTurn = cross * sign * geomSign < -1e-5;
+    if (isConvexTurn) {
+      out.push({ ...prev.b });
+      const ang1 = Math.atan2(prev.nr, prev.nz);
+      const ang2 = Math.atan2(next.nr, next.nz);
+      let dAng = ang2 - ang1;
+      while (dAng <= -Math.PI) dAng += Math.PI * 2;
+      while (dAng > Math.PI) dAng -= Math.PI * 2;
+      const steps = Math.max(1, Math.min(18, Math.ceil(Math.abs(dAng) / ((8 * Math.PI) / 180))));
+      for (let s = 1; s < steps; s++) {
+        const a = ang1 + (dAng * s) / steps;
+        const c = compContactPoint([Math.cos(a), Math.sin(a)], comp, shape);
+        out.push({ z: clean[i].z - c[0], r: clean[i].r - c[1] });
+      }
+      if (Math.hypot(next.a.z - out[out.length - 1].z, next.a.r - out[out.length - 1].r) > 1e-8) {
+        out.push({ ...next.a });
+      }
+      continue;
+    }
+
+    const directHit = segCross(prev.a, prev.b, next.a, next.b);
+    if (directHit) {
+      out.push(directHit);
+      continue;
+    }
+
+    let joined: Sample | null = null;
+    if (Math.abs(cross) >= 1e-8) {
+      const qz = next.a.z - prev.a.z, qr = next.a.r - prev.a.r;
+      const t = (qz * next.tr - qr * next.tz) / cross;
+      const candidate = { z: prev.a.z + prev.tz * t, r: prev.a.r + prev.tr * t };
+      const miter = Math.hypot(candidate.z - clean[i].z, candidate.r - clean[i].r);
+      const maxMiter = Math.max(0.2, maxToolSpan * 4);
+      if (Number.isFinite(miter) && miter <= maxMiter) {
+        joined = candidate;
+      }
+    }
+    if (joined) {
+      out.push(joined);
+    } else {
+      out.push({ ...prev.b });
+      if (Math.hypot(next.a.z - prev.b.z, next.a.r - prev.b.r) > 1e-9) {
+        out.push({ ...next.a });
+      }
+    }
+  }
+
+  const lastSeg = segments[segments.length - 1];
+  out.push({ ...lastSeg.b });
+
+  /* تضمین ادامه تا انتهای واقعی خط (یا نقطه اسپیلیت) در پروفیل بیرونی: اگر قطعه آخر شیب رو به بالا داشته باشد
+     به‌طوری که نقطه تماس قبل از انتهای خط متوقف شود، ابزار حول نقطه انتهایی تا بالای آن می‌چرخد */
+  if (!clipToAxis && lastSeg.nz * geomSign < -1e-4 && lastSeg.nr * sign >= -1e-4) {
+    const endN: [number, number] = [0, sign];
+    const ang1 = Math.atan2(lastSeg.nr, lastSeg.nz);
+    const ang2 = Math.atan2(endN[1], endN[0]);
+    let dAng = ang2 - ang1;
+    while (dAng <= -Math.PI) dAng += Math.PI * 2;
+    while (dAng > Math.PI) dAng -= Math.PI * 2;
+    const steps = Math.max(1, Math.min(16, Math.ceil(Math.abs(dAng) / ((8 * Math.PI) / 180))));
+    for (let s = 1; s <= steps; s++) {
+      const a = ang1 + (dAng * s) / steps;
+      const c = compContactPoint([Math.cos(a), Math.sin(a)], comp, shape);
+      const pt = { z: clean[n - 1].z - c[0], r: clean[n - 1].r - c[1] };
+      if (Math.hypot(pt.z - out[out.length - 1].z, pt.r - out[out.length - 1].r) > 1e-8) {
+        out.push(pt);
+      }
+    }
+  }
+
+  if (!clipToAxis) {
+    const trimmed = trimOffsetLoops(out).map((p) => ({ z: p.z, r: Math.max(clampMinR, p.r) }));
+    return densifyPolyline(trimmed, 1.2);
+  }
+
+  /* برش روی محور R=0 برای مسیرهای داخل‌تراشی (از دهانه به کف) */
+  const clipped: Sample[] = [];
+  for (let i = 0; i < out.length; i++) {
+    const point = out[i];
+    if (point.r >= -1e-9) {
+      clipped.push({ z: point.z, r: Math.max(0, point.r) });
+      continue;
+    }
+    if (clipped.length && i > 0) {
+      const prev = out[i - 1];
+      const t = prev.r / Math.max(1e-12, prev.r - point.r);
+      clipped.push({ z: prev.z + (point.z - prev.z) * t, r: 0 });
+    }
+    break;
+  }
+  let result = clipped.length >= 2 ? clipped : out.map((point) => ({ z: point.z, r: Math.max(0, point.r) }));
+  result = trimOffsetLoops(result);
+  const last = result[result.length - 1];
+  if (last && last.r > 1e-9) {
+    const prev = result[result.length - 2];
+    if (prev && last.r < prev.r - 1e-9) {
+      const t = last.r / (prev.r - last.r);
+      result.push({ z: last.z + (last.z - prev.z) * t, r: 0 });
+    } else {
+      result.push({ z: last.z, r: 0 });
+    }
+  } else if (last) last.r = 0;
+  return densifyPolyline(result, 1.2);
+}
+
+/** اعمال جبران شعاع ابزار به پروفیل بیرونی (خط طرح یا خط آفست) در کل طول از ابتدا تا انتها / نقطه اسپیلیت */
+export function compensateOuterPolyline(
+  poly: Sample[],
+  comp?: OpToolComp,
+  forRoughEnvelope = false,
+  clampMinR = 0
+): Sample[] {
+  if (!comp || !comp.enabled || comp.mode === "G40" || poly.length < 2) {
+    return poly;
+  }
+  const shape = makeCompToolShape(comp);
+  const geomSign = (comp.mode === "G41" ? 1 : -1) * comp.direction;
+  const clean = compactExactlyCollinear(poly);
+  const totalDz = clean.length >= 2 ? clean[clean.length - 1].z - clean[0].z : 1;
+  const totalDr = clean.length >= 2 ? clean[clean.length - 1].r - clean[0].r : 0;
+  const leftIsOutward = Math.abs(totalDz) > 1e-6 ? totalDz > 0 : totalDr <= 0;
+  const compensated = continuousToolOffset(poly, comp, shape, leftIsOutward, false, clampMinR);
+  if (forRoughEnvelope && geomSign > 0 && compensated.length >= 2) {
+    return buildRadialUpperEnvelope(compensated);
+  }
+  return compensated;
+}
+
+/** اعمال جبران شعاع ابزار به پروفیل داخلی (کاسه: از کف به دهانه) */
+export function compensateInnerPolyline(innerBottomToRim: Sample[], comp?: OpToolComp): Sample[] {
+  if (!comp || !comp.enabled || comp.mode === "G40" || innerBottomToRim.length < 2) {
+    return innerBottomToRim;
+  }
+  const rimToBottom = [...innerBottomToRim].reverse();
+  const shape = makeCompToolShape(comp);
+  const leftSide = innerOffsetLeftSide(rimToBottom);
+  return continuousToolOffset(rimToBottom, comp, shape, leftSide, true).reverse();
+}
+
+/** تبدیل تنظیمات جبران شعاع عملیات به ToolProfile برای نمایش و براده‌برداری در شبیه‌ساز */
+export function toolProfileFromComp(comp: OpToolComp, fallback: ToolProfile): ToolProfile {
+  if (!comp.enabled || comp.mode === "G40") return fallback;
+  const shape = makeCompToolShape(comp);
+  if (shape.length < 2) return fallback;
+  let min = Infinity,
+    max = -Infinity,
+    minY = Infinity,
+    maxY = -Infinity;
+  for (const [x, y] of shape) {
+    if (x < min) min = x;
+    if (x > max) max = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  if (!Number.isFinite(min) || max - min < 1e-6) return fallback;
+  const pts: [number, number][] = [];
+  const step = 0.2;
+  const evalLowerY = (x: number): number => {
+    let best = Infinity;
+    for (let i = 0; i < shape.length; i++) {
+      const a = shape[i];
+      const b = shape[(i + 1) % shape.length];
+      const lo = Math.min(a[0], b[0]);
+      const hi = Math.max(a[0], b[0]);
+      if (x < lo - 1e-7 || x > hi + 1e-7) continue;
+      if (Math.abs(b[0] - a[0]) < 1e-8) {
+        best = Math.min(best, a[1], b[1]);
+      } else {
+        const t = Math.max(0, Math.min(1, (x - a[0]) / (b[0] - a[0])));
+        best = Math.min(best, a[1] + t * (b[1] - a[1]));
+      }
+    }
+    return Number.isFinite(best) ? best : minY;
+  };
+  for (let dz = min; dz <= max + 1e-9; dz += step) {
+    const z = Math.min(max, dz);
+    pts.push([z, evalLowerY(z)]);
+  }
+  if (!pts.length || Math.abs(pts[pts.length - 1][0] - max) > 1e-5) {
+    pts.push([max, evalLowerY(max)]);
+  }
+  return {
+    min,
+    max,
+    pts,
+    height: Math.max(4, maxY - minY),
+  };
+}
+
+/* ---------------- عملیات و استراتژی‌های تراش ---------------- */
+
+export type OpType = "round" | "face" | "rough-d" | "rough-z" | "copy" | "offset" | "finish" | "inner-rough" | "inner-offset" | "inner-finish" | "bottom";
+
+export interface Op {
+  id: number;
+  type: OpType;
+  on: boolean;
+  reverse?: boolean; // معکوس‌کردن جهت شروع عملیات
+  holder: 1 | 2; // هلدر مجری عملیات: ۱ = هلدر اصلی (خارج) ، ۲ = هلدر چرخیده (داخل)
+  toolComp?: OpToolComp; // تنظیمات جبران شعاع و هندسه ابزار اختصاصی این عملیات
+}
+
+export const OP_INFO: Record<OpType, { name: string; desc: string; color: string }> = {
+  round: { name: "گرد کردن گوشه‌ها", desc: "برداشت قسمت اضافی مقطع تا استوانهٔ قطر واقعی", color: "#b48ee0" },
+  face: { name: "پیشانی‌تراشی", desc: "تراش سطح سر قطعه تا شعاع طرح", color: "#e3a94e" },
+  "rough-d": { name: "خشن شعاعی G71", desc: "لایه‌های قطری با حرکت طولی", color: "#45b394" },
+  "rough-z": { name: "خشن محوری G72", desc: "فرورفتن شعاعی در گام‌های طولی", color: "#6ab0d8" },
+  copy: { name: "کپی‌تراشی", desc: "مسیرهای موازی با خط طرح", color: "#a3c15c" },
+  offset: { name: "آفست", desc: "خط موازی با طرح — مرجع مراحل خشن", color: "#f59a80" },
+  finish: { name: "پرداخت نهایی", desc: "حرکت دقیق روی خط اصلی طرح", color: "#e0703c" },
+  "inner-rough": { name: "خشن داخل (کاسه)", desc: "خالی‌کردن داخل کاسه با هلدر دوم", color: "#4cc9f0" },
+  "inner-offset": { name: "افست داخل تراشی", desc: "مسیر موازی دیواره داخلی پیش از پرداخت", color: "#c77dff" },
+  "inner-finish": { name: "پرداخت داخل", desc: "پرداخت دیواره داخلی با هلدر دوم", color: "#f72585" },
+  bottom: { name: "کف‌تراشی", desc: "برداشت طول اضافی خام پشت صفحه دهانه با هلدر داخل‌تراشی", color: "#ffd166" },
+};
+
+export const ALL_OP_TYPES: OpType[] = ["round", "face", "rough-d", "rough-z", "copy", "offset", "finish", "bottom", "inner-rough", "inner-offset", "inner-finish"];
+
+export interface Strategy {
+  id: string;
+  name: string;
+  types: OpType[];
+}
+
+export const STRATEGIES: Strategy[] = [
+  { id: "g71", name: "استاندارد شعاعی", types: ["round", "rough-d", "offset", "finish"] },
+  { id: "g72", name: "محوری پله‌ای", types: ["round", "rough-z", "offset", "finish"] },
+  { id: "copy", name: "کپی‌تراشی", types: ["round", "copy", "offset", "finish"] },
+  { id: "bowl", name: "کاسه داخل+خارج", types: ["round", "rough-d", "offset", "finish", "bottom", "inner-rough", "inner-offset", "inner-finish"] },
+];
+
+export function makeOps(types: OpType[]): Op[] {
+  const ops = types.map((t) => ({ id: opUid++, type: t, on: true, reverse: false, holder: DEFAULT_HOLDER[t] }));
+  /* پیش‌فرض: همیشه عملیات خارج‌تراشی اول و داخل‌تراشی بعد از آن (جابه‌جایی دستی با درگ/فلش آزاد است) */
+  return outerFirstOps(ops);
+}
+
+/** مرتب‌سازی پایدار: بیرونی‌ها به ترتیب فعلی، سپس داخل‌ها به ترتیب فعلی */
+export function outerFirstTypes(types: OpType[]): Op[] extends never ? never : OpType[] {
+  return [...types.filter((t) => !INNER_OPS.includes(t)), ...types.filter((t) => INNER_OPS.includes(t))];
+}
+
+export function outerFirstOps<T extends { type: OpType }>(ops: T[]): T[] {
+  const outer: T[] = [];
+  const inner: T[] = [];
+  for (const o of ops) (INNER_OPS.includes(o.type) ? inner : outer).push(o);
+  return [...outer, ...inner];
+}
+
+/** محل درج پیش‌فرضِ عملیات تازه: بیرونی ← انتهای بلوک بیرونی، داخلی ← انتهای زنجیره */
+export function defaultOpInsertIndex(ops: { type: OpType }[], type: OpType): number {
+  if (INNER_OPS.includes(type)) return ops.length;
+  const firstInner = ops.findIndex((o) => INNER_OPS.includes(o.type));
+  return firstInner === -1 ? ops.length : firstInner;
+}
+
+export function normalizeOps(raw: unknown, legacy = false): Op[] | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const out: Op[] = [];
+  for (const o of raw as { type?: unknown; on?: unknown; id?: unknown; toolComp?: unknown }[]) {
+    if (!o || typeof o.type !== "string") continue;
+    let t = o.type;
+    if (legacy) {
+      /* داده‌های پیش از نسخه ۲: «offset» کپی‌تراشی بود و «spring» پاس فنری */
+      if (t === "offset") t = "copy";
+      else if (t === "spring") t = "offset";
+    }
+    if ((ALL_OP_TYPES as string[]).includes(t)) {
+      const hh = (o as { holder?: unknown }).holder;
+      const toolComp = normalizeOpToolComp(o.toolComp);
+      out.push({
+        id: typeof o.id === "number" ? o.id : opUid++,
+        type: t as OpType,
+        on: o.on !== false,
+        reverse: (o as { reverse?: unknown }).reverse === true,
+        holder: hh === 2 ? 2 : hh === 1 ? 1 : DEFAULT_HOLDER[t as OpType],
+        ...(toolComp ? { toolComp } : {}),
+      });
+    }
+  }
+  /* مهاجرت زنجیره‌های کاسه ذخیره‌شده پیش از افزوده‌شدن آفست داخل‌تراشی. */
+  if (out.some((o) => o.type === "inner-rough") && out.some((o) => o.type === "inner-finish") && !out.some((o) => o.type === "inner-offset")) {
+    const roughAt = out.findIndex((o) => o.type === "inner-rough");
+    const id = Math.max(0, ...out.map((o) => o.id)) + 1;
+    out.splice(roughAt + 1, 0, { id, type: "inner-offset", on: true, holder: 2 });
+  }
+  if (legacy && out.length) {
+    /* «آفست» (پاس فنری سابق) همیشه بعد از پرداخت بود؛ حالا باید قبل از آن باشد */
+    const offsets = out.filter((o) => o.type === "offset");
+    if (offsets.length) {
+      const rest = out.filter((o) => o.type !== "offset");
+      const fi = rest.findIndex((o) => o.type === "finish");
+      if (fi >= 0) rest.splice(fi, 0, ...offsets);
+      else rest.push(...offsets);
+      return rest;
+    }
+  }
+  return out.length ? out : null;
+}
+
+export interface Seg {
+  motion: 0 | 1; // 0 = G0 سریع ، 1 = G1 برشی
+  x1: number; // قطر شروع
+  z1: number;
+  x2: number; // قطر پایان
+  z2: number;
+  feed: number;
+  feedOvr?: boolean; // فیدِ دستی ویرایش مسیر؛ از ساده‌سازی global feed مستثناست
+  forceFeed?: boolean; // صدور صریح F حتی اگر مقدار مودال با حرکت قبلی برابر باشد
+  /** تغییر سرعت/نوع حرکت پله‌های G0 مصنوعی پیش از این سگمنت (کلید = شماره پله). */
+  bridgeMoves?: Record<number, { motion: 0 | 1; feed: number }>;
+  line: number; // اندیس خط در آرایه خطوط جی‌کد
+  kind: SegKind;
+  op: OpType | "sys"; // عملیات مولد این حرکت
+  opId: number; // شناسه نمونه عملیات (برای نمایش ایزوله و خروجی تفکیکی) — حرکات سیستمی: 1-
+  holder: 1 | 2; // هلدر مجری — مختصات هلدر ۲ در پس‌پردازنده تبدیل می‌شود
+  note?: string[]; // کامنت‌های قبل از این حرکت (فقط فرمت استاندارد)
+  fan?: number; // گسترش G0 این حرکت در جی‌کد (+قطر، فقط حرکت سریع طولی در/بالای رترکت؛ پیش‌فرض ۰)
+  fanU?: number; // گسترش G0 در راستای محور (+طول، فقط بیرون قطعه یا رانش داخل‌خط تراورس؛ پیش‌فرض ۰)
+  ovrKey?: string; // کلید پایدار خط برای «ویرایش مسیر» (عملیات:شماره‌خط در عملیات)
+}
+
+export interface GenResult {
+  lines: string[];
+  segs: Seg[];
+  samples: Sample[];
+  innerSamples: Sample[]; // دیواره داخلی کاسه (خالی وقتی Split غیرفعال است)
+  cutLen: number;
+  rapidLen: number;
+  timeSec: number;
+  volumeCm3: number;
+  roughLayers: number;
+  format: CodeFormat;
+}
+
+const f2 = (v: number) => (Math.round(v * 100) / 100).toFixed(2);
+
+/* ---------------- نمونه‌برداری از پروفایل (Catmull-Rom) ---------------- */
+
+function cr(p0: number, p1: number, p2: number, p3: number, t: number) {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return (
+    0.5 *
+    (2 * p1 +
+      (-p0 + p2) * t +
+      (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+      (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+  );
+}
+
+export function sampleProfile(points: PPoint[], blankR: number): Sample[] {
+  const clampR = (r: number, R: number) => Math.min(Math.max(r, 0), R);
+  const rawPts = [...points];
+  if (rawPts.length >= 2 && rawPts[rawPts.length - 1].z < rawPts[0].z - 1e-6) {
+    rawPts.reverse();
+  }
+  const out: Sample[] = [];
+  if (rawPts.length === 0) return out;
+  if (rawPts.length === 1) return [{ z: rawPts[0].z, r: clampR(rawPts[0].r, blankR) }];
+
+  for (let i = 0; i < rawPts.length - 1; i++) {
+    const p0 = rawPts[Math.max(0, i - 1)];
+    const p1 = rawPts[i];
+    const p2 = rawPts[i + 1];
+    const p3 = rawPts[Math.min(rawPts.length - 1, i + 2)];
+    const segLen = Math.hypot(p2.z - p1.z, p2.r - p1.r);
+    const smooth = p1.smooth && p2.smooth;
+    const steps = smooth ? Math.max(6, Math.ceil(segLen / 1.2)) : Math.max(1, Math.ceil(segLen / 1.2));
+    const startJ = i === 0 ? 0 : 1;
+    for (let j = startJ; j <= steps; j++) {
+      const t = j / steps;
+      let z: number, r: number;
+      if (smooth) {
+        z = cr(p0.z, p1.z, p2.z, p3.z, t);
+        r = cr(p0.r, p1.r, p2.r, p3.r, t);
+      } else {
+        z = p1.z + (p2.z - p1.z) * t;
+        r = p1.r + (p2.r - p1.r) * t;
+      }
+      out.push({ z, r: clampR(r, blankR) });
+    }
+  }
+  return out;
+}
+
+/** حذف فقط نقاط میانیِ واقعاً هم‌خط از مسیر نهایی؛ نمونه‌های متراکم موتور برای
+ * محاسبات Offset، برخورد و خشن‌کاری دست‌نخورده می‌مانند. تلرانس یک نانومتر است
+ * تا هیچ بخش منحنی یا شکست هندسی به‌صورت تقریبی صاف نشود. */
+function compactExactlyCollinear<T extends { z: number; r: number }>(points: T[]): T[] {
+  if (points.length <= 2) return [...points];
+  const out: T[] = [points[0]];
+  for (let i = 1; i < points.length - 1; i++) {
+    const a = out[out.length - 1], b = points[i], c = points[i + 1];
+    const acZ = c.z - a.z, acR = c.r - a.r;
+    const length = Math.hypot(acZ, acR);
+    const distance = length > 1e-15 ? Math.abs((b.z - a.z) * acR - (b.r - a.r) * acZ) / length : Infinity;
+    const forward = (b.z - a.z) * (c.z - b.z) + (b.r - a.r) * (c.r - b.r) >= -1e-15;
+    if (distance > 1e-9 || !forward) out.push(b);
+  }
+  out.push(points[points.length - 1]);
+  return out;
+}
+
+/** نمونه‌برداری مسیر با حفظ ترتیب زنجیره؛ برای شاخه داخلیِ برگشتی ضروری است. */
+export function sampleOrderedProfile(points: PPoint[], blankR: number): Sample[] {
+  const clampR = (r: number) => Math.min(Math.max(r, 0), blankR);
+  const pts = [...points];
+  const out: Sample[] = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    const smooth = p1.smooth && p2.smooth;
+    /* زنجیره‌های branchPathPoints از قبل نمونه‌برداری شده‌اند؛ افزودن حداقل شش
+       نقطه روی هر خط مستقیم، مرز آبی را بی‌دلیل تا حدود ۹۰۰ رأس متورم می‌کرد. */
+    const steps = smooth ? Math.max(6, Math.ceil(Math.hypot(p2.z - p1.z, p2.r - p1.r) / 1.2)) : Math.max(1, Math.ceil(Math.hypot(p2.z - p1.z, p2.r - p1.r) / 1.2));
+    for (let j = i === 0 ? 0 : 1; j <= steps; j++) {
+      const t = j / steps;
+      out.push(smooth
+        ? { z: cr(p0.z, p1.z, p2.z, p3.z, t), r: clampR(cr(p0.r, p1.r, p2.r, p3.r, t)) }
+        : { z: p1.z + (p2.z - p1.z) * t, r: clampR(p1.r + (p2.r - p1.r) * t) });
+    }
+  }
+  return out;
+}
+
+/** پوشش امن و یکنواخت X برای خشن‌کاری از یک مسیر داخلیِ چندمقداری. */
+function innerRoughEnvelope(path: Sample[]): Sample[] {
+  const sorted = [...path].sort((a, b) => a.z - b.z);
+  const out: Sample[] = [];
+  for (const point of sorted) {
+    const last = out[out.length - 1];
+    if (last && Math.abs(last.z - point.z) < 0.06) {
+      if (point.r < last.r) last.r = point.r; // شاخه امن‌تر/داخلی‌تر
+    } else out.push({ ...point });
+  }
+  return out;
+}
+
+/* ---------------- پوش بالایی شعاعی و بازه‌های برش برای یک لایه خشن ---------------- */
+
+/* بیشینهٔ شعاع تمام پاره‌خط‌های یک زنجیره در مختصات طولی z */
+function upperRadiusOnPoly(poly: Sample[], z: number): number {
+  if (!poly.length) return 0;
+  if (poly.length === 1) return poly[0].r;
+  let minZ = Infinity, maxZ = -Infinity;
+  let leftPt = poly[0], rightPt = poly[poly.length - 1];
+  for (const q of poly) {
+    if (q.z < minZ) { minZ = q.z; leftPt = q; }
+    if (q.z > maxZ) { maxZ = q.z; rightPt = q; }
+  }
+  if (z <= minZ - 1e-7) {
+    let best = leftPt.r;
+    for (const q of poly) if (Math.abs(q.z - minZ) <= 1e-6 && q.r > best) best = q.r;
+    return best;
+  }
+  if (z >= maxZ + 1e-7) {
+    let best = rightPt.r;
+    for (const q of poly) if (Math.abs(q.z - maxZ) <= 1e-6 && q.r > best) best = q.r;
+    return best;
+  }
+  let best = -Infinity;
+  for (let i = 0; i < poly.length - 1; i++) {
+    const a = poly[i], b = poly[i + 1];
+    const dz = b.z - a.z;
+    if (Math.abs(dz) <= 1e-9) {
+      if (Math.abs(z - a.z) <= 1e-6) {
+        const hi = Math.max(a.r, b.r);
+        if (hi > best) best = hi;
+      }
+      continue;
+    }
+    const lo = Math.min(a.z, b.z), hi = Math.max(a.z, b.z);
+    if (z >= lo - 1e-7 && z <= hi + 1e-7) {
+      const t = Math.max(0, Math.min(1, (z - a.z) / dz));
+      const r = a.r + (b.r - a.r) * t;
+      if (r > best) best = r;
+    }
+  }
+  return Number.isFinite(best) ? best : leftPt.r;
+}
+
+/* کمینهٔ شعاع تمام پاره‌خط‌های یک زنجیره در مختصات طولی z */
+function lowerRadiusOnPoly(poly: Sample[], z: number): number {
+  if (!poly.length) return 0;
+  if (poly.length === 1) return poly[0].r;
+  let best = Infinity;
+  for (let i = 0; i < poly.length - 1; i++) {
+    const a = poly[i], b = poly[i + 1];
+    const dz = b.z - a.z;
+    if (Math.abs(dz) <= 1e-9) {
+      if (Math.abs(z - a.z) <= 1e-6) {
+        const lo = Math.min(a.r, b.r);
+        if (lo < best) best = lo;
+      }
+      continue;
+    }
+    const lo = Math.min(a.z, b.z), hi = Math.max(a.z, b.z);
+    if (z >= lo - 1e-7 && z <= hi + 1e-7) {
+      const t = Math.max(0, Math.min(1, (z - a.z) / dz));
+      const r = a.r + (b.r - a.r) * t;
+      if (r < best) best = r;
+    }
+  }
+  return Number.isFinite(best) ? best : upperRadiusOnPoly(poly, z);
+}
+
+/* ساخت پوش بالاییِ قابل‌دسترس شعاعی (با حفظ پرش‌های عمودی دقیق روی دیواره‌های +۹۰° و −۹۰°) */
+function buildRadialUpperEnvelope(poly: Sample[]): Sample[] {
+  if (poly.length <= 1) return poly.map((p) => ({ ...p }));
+  const compact = compactExactlyCollinear(poly);
+  const nonVert: { a: Sample; b: Sample; minZ: number; maxZ: number }[] = [];
+  const zBreaks: number[] = [];
+  for (const q of compact) zBreaks.push(q.z);
+  for (let i = 0; i < compact.length - 1; i++) {
+    const a = compact[i], b = compact[i + 1];
+    if (Math.abs(b.z - a.z) <= 1e-9) continue;
+    nonVert.push({ a, b, minZ: Math.min(a.z, b.z), maxZ: Math.max(a.z, b.z) });
+  }
+  for (let i = 0; i < nonVert.length; i++) {
+    const s1 = nonVert[i];
+    for (let j = i + 1; j < nonVert.length; j++) {
+      const s2 = nonVert[j];
+      if (s2.minZ >= s1.maxZ - 1e-7 || s2.maxZ <= s1.minZ + 1e-7) continue;
+      const P = segCross(s1.a, s1.b, s2.a, s2.b);
+      if (P) zBreaks.push(P.z);
+    }
+  }
+  zBreaks.sort((x, y) => x - y);
+  const zs: number[] = [];
+  for (const z of zBreaks) {
+    if (!zs.length || z - zs[zs.length - 1] > 1e-6) zs.push(z);
+  }
+  if (zs.length < 2) return compact;
+
+  const out: Sample[] = [];
+  const pushPt = (z: number, r: number) => {
+    const last = out[out.length - 1];
+    if (!last || Math.hypot(z - last.z, r - last.r) > 1e-7) out.push({ z, r });
+  };
+  for (let k = 0; k < zs.length - 1; k++) {
+    const zA = zs[k], zB = zs[k + 1], zMid = 0.5 * (zA + zB);
+    let bestSeg: { a: Sample; b: Sample } | null = null;
+    let bestMidR = -Infinity;
+    for (const seg of nonVert) {
+      if (zMid < seg.minZ - 1e-7 || zMid > seg.maxZ + 1e-7) continue;
+      const t = (zMid - seg.a.z) / (seg.b.z - seg.a.z);
+      const rMid = seg.a.r + (seg.b.r - seg.a.r) * t;
+      if (rMid > bestMidR) {
+        bestMidR = rMid;
+        bestSeg = seg;
+      }
+    }
+    if (!bestSeg) continue;
+    const tA = Math.max(0, Math.min(1, (zA - bestSeg.a.z) / (bestSeg.b.z - bestSeg.a.z)));
+    const tB = Math.max(0, Math.min(1, (zB - bestSeg.a.z) / (bestSeg.b.z - bestSeg.a.z)));
+    const rA = bestSeg.a.r + (bestSeg.b.r - bestSeg.a.r) * tA;
+    const rB = bestSeg.a.r + (bestSeg.b.r - bestSeg.a.r) * tB;
+    pushPt(zA, rA);
+    pushPt(zB, rB);
+  }
+  return out.length >= 2 ? densifyPolyline(out, 1.2) : compact;
+}
+
+function mergeZIntervals(list: { a: number; b: number }[], gapTol = 1e-5): { a: number; b: number }[] {
+  const valid = list.filter((iv) => iv.b - iv.a > 1e-7).sort((x, y) => x.a - y.a || x.b - y.b);
+  const out: { a: number; b: number }[] = [];
+  for (const iv of valid) {
+    const last = out[out.length - 1];
+    if (last && iv.a <= last.b + gapTol) {
+      if (iv.b > last.b) last.b = iv.b;
+    } else {
+      out.push({ a: iv.a, b: iv.b });
+    }
+  }
+  return out;
+}
+
+function cutIntervals(samples: Sample[], layer: number) {
+  if (samples.length < 2) return [];
+  const rLim = layer - 0.01;
+  const openRaw: { a: number; b: number }[] = [];
+  const blockedRaw: { a: number; b: number }[] = [];
+  const verticalBarriers: number[] = [];
+
+  for (let i = 0; i < samples.length - 1; i++) {
+    const a = samples[i], b = samples[i + 1];
+    const dz = b.z - a.z;
+    if (Math.abs(dz) <= 1e-9) {
+      if (Math.max(a.r, b.r) >= rLim) verticalBarriers.push(a.z);
+      continue;
+    }
+    const zLo = Math.min(a.z, b.z), zHi = Math.max(a.z, b.z);
+    if (a.r < rLim && b.r < rLim) {
+      openRaw.push({ a: zLo, b: zHi });
+    } else if (a.r >= rLim && b.r >= rLim) {
+      blockedRaw.push({ a: zLo, b: zHi });
+    } else {
+      const t = (rLim - a.r) / (b.r - a.r);
+      const zCross = a.z + dz * Math.max(0, Math.min(1, t));
+      if (a.r < rLim) {
+        openRaw.push({ a: Math.min(a.z, zCross), b: Math.max(a.z, zCross) });
+        blockedRaw.push({ a: Math.min(zCross, b.z), b: Math.max(zCross, b.z) });
+      } else {
+        blockedRaw.push({ a: Math.min(a.z, zCross), b: Math.max(a.z, zCross) });
+        openRaw.push({ a: Math.min(zCross, b.z), b: Math.max(zCross, b.z) });
+      }
+    }
+  }
+
+  let current = mergeZIntervals(openRaw, 1e-5);
+  const blocked = mergeZIntervals(blockedRaw, 1e-6);
+
+  /* حذف هر بازه‌ای که پوش بالایی در آن بالاتر یا مساوی لایهٔ فعلی است (مانند لبه‌های Overhang) */
+  for (const blk of blocked) {
+    const next: { a: number; b: number }[] = [];
+    for (const iv of current) {
+      if (blk.b <= iv.a + 1e-7 || blk.a >= iv.b - 1e-7) {
+        next.push(iv);
+        continue;
+      }
+      if (blk.a > iv.a + 1e-7) next.push({ a: iv.a, b: blk.a });
+      if (blk.b < iv.b - 1e-7) next.push({ a: blk.b, b: iv.b });
+    }
+    current = next;
+  }
+
+  /* اگر تیغهٔ عمودی صفرضخامت بین دو ناحیهٔ باز قرار گرفته باشد، اجازه عبور از آن را نده */
+  for (const bz of verticalBarriers) {
+    const next: { a: number; b: number }[] = [];
+    for (const iv of current) {
+      if (bz > iv.a + 1e-5 && bz < iv.b - 1e-5) {
+        next.push({ a: iv.a, b: bz - 1e-3 }, { a: bz + 1e-3, b: iv.b });
+      } else {
+        next.push(iv);
+      }
+    }
+    current = next;
+  }
+
+  return current.filter((iv) => iv.b - iv.a > 0.3);
+}
+
+/* ---------------- نواحی قطعه برای خشن ناحیه‌ای ----------------          */
+/* پروفایل بر اساس قله‌ها و دره‌های شعاعی به نواحی یکنواخت تقسیم می‌شود تا   */
+/* ابزار هر ناحیه را به‌طور کامل (همهٔ لایه‌ها) با الگوی رفت‌وبرگشتی تراش    */
+/* دهد و سپس به ناحیهٔ بعد برود — بدون جابه‌جایی‌های مکرر بین نواحی.         */
+export function findZones(rawSamples: Sample[]): { a: number; b: number }[] {
+  if (!rawSamples.length) return [{ a: 0, b: 0 }];
+  let minSampleZ = Infinity, maxSampleZ = -Infinity;
+  for (const q of rawSamples) {
+    if (q.z < minSampleZ) minSampleZ = q.z;
+    if (q.z > maxSampleZ) maxSampleZ = q.z;
+  }
+  const spanZ = maxSampleZ - minSampleZ;
+  const gridCount = spanZ > 1e-6 ? Math.max(8, Math.ceil(spanZ / 1.0)) : 0;
+  const samples: Sample[] = gridCount >= 7
+    ? Array.from({ length: gridCount + 1 }, (_, i) => {
+        const z = minSampleZ + (spanZ * i) / gridCount;
+        return { z, r: upperRadiusOnPoly(rawSamples, z) };
+      })
+    : rawSamples;
+  const n = samples.length;
+  const z0 = samples[0]?.z ?? 0;
+  const z1 = samples[n - 1]?.z ?? 0;
+  if (n < 7) return [{ a: z0, b: z1 }];
+  // هموارسازی شعاع برای حذف نویز
+  const rs: number[] = samples.map((_, i) => {
+    let s = 0;
+    let c = 0;
+    for (let j = Math.max(0, i - 2); j <= Math.min(n - 1, i + 2); j++) {
+      s += samples[j].r;
+      c++;
+    }
+    return s / c;
+  });
+  // پنجرهٔ تشخیص برحسب میلی‌متر (~۶mm) و آستانهٔ برجستگی نسبی به دامنهٔ شعاع
+  const dz = (z1 - z0) / (n - 1);
+  const W = Math.max(3, Math.round(6 / Math.max(0.2, dz)));
+  let minR = Infinity;
+  let maxR = -Infinity;
+  for (const r of rs) {
+    if (r < minR) minR = r;
+    if (r > maxR) maxR = r;
+  }
+  const prom = Math.max(0.5, (maxR - minR) * 0.05);
+
+  /* مرزها فقط روی نوک هر قله (بیشینهٔ شعاع) قرار می‌گیرند — دره‌ها مرز نیستند.   */
+  /* برجستگی هر قله نسبت به دره‌های مجاورش سنجیده می‌شود تا هم قله‌های تیز و هم  */
+  /* قله‌های پهن (مثل شکم گلدان) شناسایی شوند.                                  */
+  const peaks: { z: number; r: number }[] = [];
+  const valleys: { z: number; r: number }[] = [];
+  for (let i = W; i < n - W; i++) {
+    let isMax = true;
+    let isMin = true;
+    for (let j = i - W; j <= i + W; j++) {
+      if (rs[j] > rs[i]) isMax = false;
+      if (rs[j] < rs[i]) isMin = false;
+    }
+    if (isMax) peaks.push({ z: samples[i].z, r: rs[i] });
+    else if (isMin) valleys.push({ z: samples[i].z, r: rs[i] });
+  }
+  // برجستگی کلاسیک: ارتفاع قله نسبت به بلندترین درهٔ مجاور (یا لبه‌ها)
+  const peakBounds: { z: number; r: number }[] = [];
+  for (const pk of peaks) {
+    let leftR = rs[0];
+    let rightR = rs[n - 1];
+    let foundLeft = false;
+    let foundRight = false;
+    for (const v of valleys) {
+      if (v.z < pk.z) {
+        leftR = v.r;
+        foundLeft = true;
+      } else if (v.z > pk.z && !foundRight) {
+        rightR = v.r;
+        foundRight = true;
+      }
+    }
+    if (!foundLeft) leftR = rs[0];
+    if (!foundRight) rightR = rs[n - 1];
+    const prominence = pk.r - Math.max(leftR, rightR);
+    if (prominence > prom) peakBounds.push(pk);
+  }
+  // حذف قله‌های نزدیک به هم (کمتر از ۳ میلی‌متر) — بلندترین قلهٔ هر خوشه نگه داشته می‌شود
+  const dedupPeak: { z: number; r: number }[] = [];
+  for (const pk of peakBounds) {
+    const last = dedupPeak[dedupPeak.length - 1];
+    if (last && pk.z - last.z < 3) {
+      if (pk.r > last.r) dedupPeak[dedupPeak.length - 1] = pk;
+    } else {
+      dedupPeak.push(pk);
+    }
+  }
+  const dedup: number[] = dedupPeak.map((p) => p.z);
+  const bounds: number[] = [z0, ...dedup, z1];
+  bounds.sort((a, b) => a - b);
+  // ساخت نواحی از کل بازهٔ قطعه (ابتدا، قله‌ها، انتها) و ادغام بخش‌های کوتاه
+  const zones: { a: number; b: number }[] = [];
+  for (let i = 0; i < bounds.length - 1; i++) {
+    if (bounds[i + 1] - bounds[i] > 0.3) zones.push({ a: bounds[i], b: bounds[i + 1] });
+  }
+  const merged: { a: number; b: number }[] = [];
+  for (const z of zones) {
+    if (z.b - z.a < 4 && merged.length) merged[merged.length - 1].b = z.b;
+    else merged.push({ ...z });
+  }
+  if (merged.length > 1 && merged[merged.length - 1].b - merged[merged.length - 1].a < 4) {
+    merged[merged.length - 2].b = merged[merged.length - 1].b;
+    merged.pop();
+  }
+  return merged.length ? merged : [{ a: z0, b: z1 }];
+}
+
+/* نواحی نهایی: اگر کاربر مرزهای دستی معتبر تعیین کرده باشد از آن استفاده می‌شود، */
+/* در غیر این صورت تقسیم خودکار بر اساس قله‌ها و دره‌ها.                            */
+export function resolveZones(_samples: Sample[], manualBounds: number[], z0: number, z1: number): { a: number; b: number }[] {
+  if (manualBounds.length) {
+    const bounds = [...manualBounds]
+      .filter((v) => v > z0 + 0.3 && v < z1 - 0.3)
+      .sort((a, b) => a - b)
+      .filter((v, i, arr) => i === 0 || v - arr[i - 1] >= 1);
+    if (bounds.length) {
+      const all = [z0, ...bounds, z1];
+      const zones: { a: number; b: number }[] = [];
+      for (let i = 0; i < all.length - 1; i++) {
+        if (all[i + 1] - all[i] > 0.3) zones.push({ a: all[i], b: all[i + 1] });
+      }
+      if (zones.length) return zones;
+    }
+  }
+  /* بدون مرز دستی، کل قطعه یک ناحیهٔ پیش‌فرض است؛ تقسیم قله/دره فقط
+     از طریق انتخاب صریح «خودکار» در ویرایشگر نواحی استفاده می‌شود. */
+  return [{ a: z0, b: z1 }];
+}
+
+/* ---------------- تولید مسیر ابزار و جی‌کد ---------------- */
+
+export function generate(pts: PPoint[], p: Params, innerPts?: PPoint[], outerFinishPts?: PPoint[]): GenResult {
+  const R = p.blankD / 2;
+  /* مسیر بیرونی از زنجیرهٔ مرتب‌شدهٔ توپولوژیک ساخته می‌شود تا خطوط قائم (+۹۰° و −۹۰°)
+     و شیارهای Uشکل هم در عملیات پرداخت، هم در عملیات افست و هم در خشن شعاعی دقیقاً شناسایی شوند. */
+  let outerFinishPath = outerFinishPts && outerFinishPts.length >= 2
+    ? sampleOrderedProfile(outerFinishPts, R)
+    : sampleProfile(pts, R);
+  if (outerFinishPath.length >= 2 && outerFinishPath[outerFinishPath.length - 1].z < outerFinishPath[0].z - 1e-6) {
+    outerFinishPath = [...outerFinishPath].reverse();
+  }
+  const samples = outerFinishPath;
+  /* مسیر ترتیبی برای Offset/Finish و پوشش یکنواخت جدا برای پاس‌های خشن.
+     ابتدای شاخه داخلی همیشه باید سرِ نزدیک به Split (لبه) و انتهای آن کف حفره باشد. */
+  let innerPathSamples = p.split.enabled && innerPts && innerPts.length >= 2 ? sampleOrderedProfile(innerPts, R) : [];
+  if (innerPathSamples.length >= 2) {
+    const dStart = Math.hypot(innerPathSamples[0].z - p.split.z, innerPathSamples[0].r - p.split.r);
+    const dEnd = Math.hypot(
+      innerPathSamples[innerPathSamples.length - 1].z - p.split.z,
+      innerPathSamples[innerPathSamples.length - 1].r - p.split.r
+    );
+    if (dEnd + 1e-6 < dStart) innerPathSamples = [...innerPathSamples].reverse();
+  }
+  /* splitChain شاخه داخلی را از لبه به کف می‌دهد؛ ماشین‌کاری پرداخت از کف به لبه است. */
+  const innerFinishPath = [...innerPathSamples].reverse();
+  const innerSamples = innerRoughEnvelope(innerPathSamples);
+  const segs: Seg[] = [];
+  const hasOuter = samples.length >= 2;
+  const hasInner = innerSamples.length >= 2;
+
+  if (!hasOuter && !hasInner) {
+    return {
+      lines: ["%", p.format === "modal" ? "M05" : "(NO PROFILE)", "M02", "%"],
+      segs: [],
+      samples,
+      innerSamples,
+      cutLen: 0,
+      rapidLen: 0,
+      timeSec: 0,
+      volumeCm3: 0,
+      roughLayers: 0,
+      format: p.format,
+    };
+  }
+
+  /* صفحهٔ جمع‌کردن باید خارج از پوشش دورانی باشد — برای مقاطع غیر دایره‌ای      */
+  /* موادِ در حال چرخش تا قطر محیطی گسترده‌اند، نه فقط قطر واقعی.                */
+  const envRot = rotationalEnvelope(p.blankD, p.blankShape);
+  const envMaxRotD = envRot.maxRotD;
+  /* تا وقتی گوشه‌های مقطع چندضلعی گرد نشده‌اند، همه جابه‌جایی‌ها باید بیرون از */
+  /* پوشش دورانی (دورترین گوشه) بمانند — نه فقط بیرون قطر واقعی.               */
+  let cornersCleared = !envRot.hasCorners;
+  const retractX = envMaxRotD + 2 * p.safety;
+  /* مولد دیگر Home سراسری ندارد؛ نقطه شروع نهایی پس از ساخت اولین عملیات از
+     سر واقعی همان عملیات استخراج می‌شود. */
+  let cur = { x: retractX, z: 0 };
+  let curOp: OpType | "sys" = "sys";
+  let curOpId = -1;
+  let curHolder: 1 | 2 = 1;
+  let notes: string[] = [];
+  const note = (s: string) => notes.push(s);
+
+  const pushSeg = (motion: 0 | 1, x: number, z: number, feed: number, kind: SegKind) => {
+    if(Math.abs(x-cur.x)<1e-9&&Math.abs(z-cur.z)<1e-9)return;
+    segs.push({
+      motion,
+      x1: cur.x,
+      z1: cur.z,
+      x2: x,
+      z2: z,
+      feed: motion ? feed : RAPID_RATE,
+      line: -1,
+      kind,
+      op: curOp,
+      opId: curOpId,
+      holder: curHolder,
+      note: notes.length ? notes : undefined,
+    });
+    notes = [];
+    cur = { x, z };
+  };
+
+  /* حرکت سریعِ امن — هر G0 به‌جای یک مسیر موربِ مستقیم (که می‌تواند از داخل      */
+  /* قطعهٔ تراش‌خورده عبور کند و در اجرا باعث برخورد تیغ با طرح شود)، به سه       */
+  /* حرکت محوریِ امن تجزیه می‌شود:                                              */
+  /*   ۱) جمع‌کردن شعاعی تا فاصلهٔ امن (حرکت به بیرون — همیشه امن)                */
+  /*   ۲) جابه‌جایی طولی در فاصلهٔ امن (X=فاصله امن > قطر قطعه)                   */
+  /*   ۳) نزدیک‌شدن شعاعی تا نقطهٔ شروع برش (که خارج از قطعه انتخاب می‌شود)        */
+  const mv = (motion: 0 | 1, x: number, z: number, feed: number, kind: SegKind, forceFeed=false) => {
+    if (motion === 0) {
+      const eps = 1e-9;
+      if (cur.x < retractX - eps) pushSeg(0, retractX, cur.z, 0, "rapid");
+      if (Math.abs(z - cur.z) > eps) pushSeg(0, Math.max(cur.x, retractX), z, 0, "rapid");
+      if (Math.abs(x - cur.x) > eps) pushSeg(0, x, z, 0, "rapid");
+      return;
+    }
+    const operationFeed = kind === "rapid" ? undefined : p.feedByKind?.[kind];
+    const resolvedFeed = operationFeed == null ? feed : Math.min(20000, Math.max(1, operationFeed));
+    /* در خشن‌تراشی شعاعی، فقط خطوط G1 شعاعیِ بلند شکسته می‌شوند.
+       بخش اول همان خط با G0 طی می‌شود و بخش پایانی، به‌اندازهٔ ۱۱۰٪
+       گام DOC بیرونی، تنها G1 باقی می‌ماند. حرکت‌های محوری/مورب و خطوط
+       کوتاه دست‌نخورده می‌مانند. مختصات X قطر است، بنابراین طول نهایی
+       در X برابر ۲ × ۱۱۰٪ DOC شعاعی است. */
+    const radialDelta = x - cur.x;
+    if (kind === "rough" && Math.abs(z - cur.z) < 1e-9 && Math.abs(radialDelta) > 5) {
+      const finalLength = Math.min(Math.abs(radialDelta), 2.2 * Math.max(0, p.doc));
+      if (finalLength > 1e-9) {
+        const direction = Math.sign(radialDelta);
+        const rapidX = x - direction * finalLength;
+        pushSeg(0, rapidX, z, 0, "rapid");
+        pushSeg(1, x, z, resolvedFeed, kind);
+        if (forceFeed && segs.length) segs[segs.length - 1].forceFeed = true;
+        return;
+      }
+    }
+    pushSeg(1, x, z, resolvedFeed, kind);
+    if(forceFeed&&segs.length)segs[segs.length-1].forceFeed=true;
+  };
+
+  /* حرکت سریعِ مستقیم بدون تجزیهٔ امن — فقط برای جابه‌جایی‌های طولی‌ای استفاده   */
+  /* می‌شود که امن‌بودنشان جداگانه با clearLongitudinal اثبات شده است (زیگزاگ)      */
+  const rawRapid = (x: number, z: number) => pushSeg(0, x, z, 0, "rapid");
+
+  /* ورود اولیه H2 مبنای واقعی جی‌کد کاسه است: از پایان آخرین عملیات H1 ابتدا
+     در +Y تا فاصله امن، سپس در +X تا فاصله تنظیم‌شده جلوتر از شروع، و سرانجام
+     در −Y تا محور ورود حرکت می‌کند. بازکُدگذاری cur هنگام تعویض هلدر باعث
+     پیوستگی دقیق مختصات ماشین می‌شود و planBridges هیچ حرکت اضافه‌ای نمی‌سازد. */
+  let firstInnerEntryDone = false;
+  const enterFirstInner = (entryX: number, mouthX: number) => {
+    if (firstInnerEntryDone) {
+      mv(0, entryX, mouthX, 0, "rapid");
+      return;
+    }
+    const lastHolder = segs.length ? segs[segs.length - 1].holder : 1;
+    if (lastHolder === 1) {
+      curHolder = 1;
+      const safeD = Math.max(retractX, cur.x);
+      if (safeD > cur.x + 1e-9) rawRapid(safeD, cur.z); // +Y
+      const entryMachineX = mouthX + p.holder2.xOff;
+      rawRapid(safeD, entryMachineX); // +X تا صفحه ورود H2
+      const safeMachineY = safeD / 2;
+      curHolder = 2;
+      /* همان نقطه ماشین، این بار در قاب مختصات H2؛ هیچ بلوک حرکتی تولید نمی‌شود. */
+      cur = { z: mouthX, x: 2 * (safeMachineY + p.holder2.yOff) };
+      rawRapid(entryX, mouthX); // −Y و بلافاصله شروع عملیات
+    } else {
+      curHolder = 2;
+      mv(0, entryX, mouthX, 0, "rapid");
+    }
+    firstInnerEntryDone = true;
+  };
+  const z0 = hasOuter ? samples[0].z : 0;
+  const zEnd = hasOuter ? samples[samples.length - 1].z : p.blankL;
+  const r0 = hasOuter ? samples[0].r : R;
+
+  let minR = Infinity;
+  for (const s of samples) if (s.r < minR) minR = s.r;
+
+  /* خط آفست — موازی با خط اصلی طرح در فاصلهٔ offsetDist (مرجع مراحل خشن) */
+  const OD = Math.max(0, p.offsetDist);
+  const IOD = Math.max(0, p.innerOffsetDist);
+
+  /* آفست دیواره داخلی باید یک مسیر یکنواخت در X باشد. آفست نرمال در نزدیکی
+     Split/دیواره‌های تقریباً عمودی می‌تواند چند نمونه با ترتیب X معکوس بسازد؛
+     مرتب‌سازی و ادغام این نمونه‌ها از حلقه و رفت‌وبرگشت مسیر جلوگیری می‌کند. */
+  /* مسیر نمایشی/پرداختی با ترتیب اصلی شاخه، بدون مرتب‌سازی مخرب برحسب X. */
+  const innerFinishOffSamples: Sample[] = hasInner
+    ? continuousPathOffset(innerPathSamples, IOD, innerOffsetLeftSide(innerPathSamples)).reverse()
+    : [];
+  /* مرز مشترک کف‌تراشی/خشن داخل، بیشترین X واقعیِ خط آفست داخلی است؛
+     Split فقط شاخه‌ها را معرفی می‌کند و مرز ماشین‌کاری محسوب نمی‌شود. */
+  const innerOperationBoundaryZ = innerFinishOffSamples.length
+    ? Math.max(...innerFinishOffSamples.map((point) => point.z))
+    : zEnd;
+  /* کف‌تراشی در سمت +X قله آفست قرار دارد. افزایش فاصله، صفحه نهایی کف را
+     از بلندترین قله دورتر می‌کند و هرگز اجازه عبور از انتهای خام را نمی‌دهد. */
+  const bottomOperationEndZ = Math.min(p.blankL, innerOperationBoundaryZ + p.bottomOffsetClearance);
+
+  /* آخرین عملیات داخل‌تراشیِ واقعاً قابل اجرا؛ عملیات بی‌اثر (مثلاً کف‌تراشی
+     بدون طول اضافه یا آفست صفر) نقطه پایان برنامه محسوب نمی‌شود. */
+  const lastRunnableInnerOpId = [...p.ops].reverse().find((o) => {
+    if (!o.on) return false;
+    if (o.type === "bottom") return hasOuter && p.blankL - bottomOperationEndZ > 0.05;
+    if (o.type === "inner-offset") return hasInner && IOD > 0.01;
+    return hasInner && (o.type === "inner-rough" || o.type === "inner-finish");
+  })?.id;
+  const nextEnabledOp = (opId: number) => {
+    const at=p.ops.findIndex(o=>o.id===opId);
+    return at<0?undefined:p.ops.slice(at+1).find(o=>o.on);
+  };
+  const nextIsInnerPath = (opId:number) => {
+    const type=nextEnabledOp(opId)?.type;
+    return type==="inner-offset"||type==="inner-finish"||type==="inner-rough";
+  };
+  const isOuterPathType=(type:OpType|undefined)=>type==="round"||type==="face"||type==="rough-d"||type==="offset"||type==="finish";
+  const nextIsOuterPath=(opId:number)=>isOuterPathType(nextEnabledOp(opId)?.type);
+  /* اتصال عمومی عملیات‌های بیرونی: خط مستقیم فقط وقتی از پروفیل/قله عبور
+     نمی‌کند G1 است. در غیر این صورت ارتفاع عبور دقیقاً بیشینه ماده + مقدار
+     Safety کاربر است؛ هیچ حاشیه ثابت یا بازگشت به رترکت سراسری افزوده نمی‌شود. */
+  const enterOuterPath=(targetR:number,targetZ:number,feed:number,kind:SegKind,axialLeadDir?:1|-1)=>{
+    const fromR=cur.x/2;
+    /* خط نزدیک‌شدن هنوز جزو عملیات مقصد نیست. رنگ، شناسه عملیات و Note مقصد
+       فقط از اولین سگمنت واقعی روی هندسه آن عملیات آغاز می‌شوند. پیشانی‌تراشی
+       استثناست: همین حرکت ورودی تنها برش واقعی آن عملیات است و باید از ابتدا
+       با نوع و رنگ خود پیشانی ثبت شود، نه با رنگ آخرین عملیات قبلی. */
+    const previousCut=[...segs].reverse().find(segment=>segment.motion===1);
+    const linkMove=(r:number,z:number)=>{
+      if(!previousCut||kind==="face"){mv(1,2*r,z,feed,kind);return;}
+      const savedOp=curOp,savedOpId=curOpId,savedHolder=curHolder,pendingNotes=notes;
+      curOp=previousCut.op;curOpId=previousCut.opId;curHolder=previousCut.holder;notes=[];
+      mv(1,2*r,z,feed,previousCut.kind);
+      curOp=savedOp;curOpId=savedOpId;curHolder=savedHolder;notes=pendingNotes;
+    };
+    const rapidWithoutTargetNotes=(r:number,z:number)=>{
+      const pendingNotes=notes;notes=[];rawRapid(2*r,z);notes=pendingNotes;
+    };
+    /* ورود اختصاصی پرداخت نهایی: دقیقاً مانند ویرایش نمونه مهره، ابتدا در X
+       به ۱٫۵mm پیش از ابتدای مسیر می‌رویم، سپس با G0 به Y شروع پرداخت می‌رسیم
+       و فقط ۱٫۵mm نهایی را با G1 محوری طی می‌کنیم. جهت برای Reverse وارونه است. */
+    if(kind==="finish"&&axialLeadDir){
+      const leadZ=targetZ-axialLeadDir*1.5;
+      /* منطق فاصله امن از قله باید پیش از الگوی X→Y حفظ شود: اگر شعاع فعلی
+         برای عبور تا صفحه ورود کافی نیست، ابتدا فقط در +Y جمع می‌کنیم. سپس
+         حرکت محوری در همان ارتفاع امن انجام و روی صفحه ورود به Y شروع می‌رسیم. */
+      const safeR=minSafeRadius(cur.z,leadZ);
+      const travelR=Math.max(fromR,safeR);
+      if(travelR>fromR+1e-7)rapidWithoutTargetNotes(travelR,cur.z);
+      rapidWithoutTargetNotes(travelR,leadZ);
+      rapidWithoutTargetNotes(targetR,leadZ);
+      mv(1,2*targetR,targetZ,feed,kind,true);
+      return;
+    }
+    /* برای ورود به آفست، مسیر اتصال تا نقطه‌ای دقیقاً ۲mm مانده به شروع با G0
+       طی می‌شود و دو میلی‌متر پایانی با G1 ادامه پیدا می‌کند. */
+    const finishLink=(r:number,z:number)=>{
+      const useTwoMillimetreLead=!!previousCut&&(kind==="offset"||kind==="finish");
+      const currentR=cur.x/2,dr=r-currentR,dz=z-cur.z,distance=Math.hypot(dr,dz);
+      if(useTwoMillimetreLead){
+        if(distance>2+1e-7){
+          const ratio=(distance-2)/distance;
+          rapidWithoutTargetNotes(currentR+dr*ratio,cur.z+dz*ratio);
+        }
+        /* از آخرین G0 به بعد، دو میلی‌متر ورود متعلق به عملیات مقصد است؛ بنابراین
+           رنگ، نوع، Feed، شناسه و Note آفست/پرداخت از همین G1 آغاز می‌شوند. */
+        mv(1,2*r,z,feed,kind);
+        return;
+      }
+      linkMove(r,z);
+    };
+    const radialOut=Math.abs(cur.z-targetZ)<1e-7&&targetR>=fromR-1e-7;
+    const frontOutside=targetR>=fromR-1e-7&&cur.z<=z0+1e-7&&targetZ<=z0+1e-7;
+    const directSafe=radialOut||frontOutside||rampIsSafe(cur.z,fromR,targetZ,targetR);
+    const diagonal=Math.abs(cur.z-targetZ)>1e-7&&Math.abs(fromR-targetR)>1e-7;
+    /* اتصال مستقیمِ مورب بین عملیات‌های بیرونی ممنوع است: ابتدا با G0 به نقطه‌ای
+       ۱mm بالاتر از بلندترِ دو سر اتصال در +Y می‌رویم، سپس در همان Y با G0 روی
+       X مقصد قرار می‌گیریم و سرانجام فقط با G1 شعاعیِ صاف در −Y وارد شروع عملیات
+       بعد می‌شویم. برای اتصال‌های رو به داخل این دقیقاً +۱mm از انتهای فعلی است؛
+       برای اتصال رو به بیرون ناچار ۱mm بالاتر از مقصد می‌ایستد تا G1 منفی بماند. */
+    if(previousCut&&directSafe&&diagonal){
+      const clearanceR=Math.max(fromR,targetR)+1;
+      rapidWithoutTargetNotes(clearanceR,cur.z);
+      rapidWithoutTargetNotes(clearanceR,targetZ);
+      mv(1,2*targetR,targetZ,feed,kind);
+      return;
+    }
+    if(directSafe){
+      finishLink(targetR,targetZ);
+      return;
+    }
+    const safeR=minSafeRadius(cur.z,targetZ);
+    const travelR=Math.max(fromR,safeR);
+    if(travelR>fromR+1e-7)rapidWithoutTargetNotes(travelR,cur.z);
+    if(Math.abs(cur.z-targetZ)>1e-7)rapidWithoutTargetNotes(travelR,targetZ);
+    finishLink(targetR,targetZ);
+  };
+  /* کوتاه‌ترین خروج امن به محور: ابتدا فقط به‌اندازه‌ای در +X حرکت می‌کنیم که
+     از بلندترین قله میان شعاع فعلی و محور، به‌علاوه Safety، عبور کنیم؛ سپس در
+     همان X امن مستقیماً به R=0 می‌رویم. */
+  const moveInnerToAxisSafely = () => {
+    const currentR=Math.max(0,cur.x/2);
+    let peak=-Infinity;
+    for(const point of innerFinishOffSamples) if(point.r<=currentR+1e-6) peak=Math.max(peak,point.z);
+    const safeZ=Math.max(cur.z,Number.isFinite(peak)?peak+p.safety:cur.z);
+    if(safeZ>cur.z+1e-7) rawRapid(cur.x,safeZ);
+    if(currentR>1e-7) rawRapid(0,safeZ);
+  };
+  let endedAtInnerEndpoint = false;
+  const finishLastInner = (opId: number): boolean => {
+    if (opId !== lastRunnableInnerOpId) return false;
+    /* اگر کاربر عملیاتی را بعد از بلوک داخل‌تراشی قرار داده باشد، این نقطه هنوز
+       پایان برنامه نیست و حرکت نهایی +X نباید وسط برنامه تزریق شود. */
+    const at = p.ops.findIndex((o) => o.id === opId);
+    if (at >= 0 && p.ops.slice(at + 1).some((o) => o.on)) return false;
+    note(`FINAL INNER END +X ${f2(p.innerEndTravel)} MM`);
+    rawRapid(cur.x, cur.z + p.innerEndTravel);
+    endedAtInnerEndpoint = true;
+    return true;
+  };
+  /* خط آفست یکنواخت: آفست نرمال واقعی (نه r+OD شعاعی).
+     آفست یک مسیر ابزار است و مجاز است بیرون قطر خام/محدوده طراحی قرار بگیرد؛
+     Clamp کردن آن به R در قله‌ها بخش منحنی را به خط صاف تبدیل می‌کرد. */
+  const offSamples: Sample[] = normalOffset(samples, OD, true);
+  /* ساخت پوش بالایی خشن‌کاری از روی خط آفست (با اعمال جبران شعاع ابزار در صورت فعال‌بودن روی عملیات خشن) */
+  const buildRoughOffForComp = (comp?: OpToolComp): { roughOff: Sample[]; floor: number } => {
+    const compOff = comp && comp.enabled && comp.mode !== "G40"
+      ? compensateOuterPolyline(offSamples, comp, true)
+      : offSamples;
+    const env: Sample[] = compOff.length >= 2 ? buildRadialUpperEnvelope(compOff) : compOff;
+    const eStartZ = env[0]?.z ?? 0;
+    const eEndZ = env[env.length - 1]?.z ?? p.blankL;
+    const sExtR = env.length
+      ? upperRadiusOnPoly(env, Math.min(eEndZ, Math.max(eStartZ, 1e-4)))
+      : r0 + OD;
+    const eExtR = env.length
+      ? upperRadiusOnPoly(env, Math.max(eStartZ, Math.min(eEndZ, p.blankL - 1e-4)))
+      : r0 + OD;
+    const rOff: Sample[] = [
+      ...(eStartZ > 1e-9 ? [{ z: 0, r: sExtR }] : []),
+      ...env,
+      ...(eEndZ < p.blankL - 1e-9 ? [{ z: p.blankL, r: eExtR }] : []),
+    ];
+    let minEnvR = Infinity;
+    for (const s of rOff) {
+      if (s.z >= -1e-6 && s.z <= p.blankL + 1e-6 && s.r < minEnvR) minEnvR = s.r;
+    }
+    return {
+      roughOff: rOff,
+      floor: Number.isFinite(minEnvR) ? minEnvR : minR + OD,
+    };
+  };
+  const baseRoughEnv = buildRoughOffForComp(undefined);
+  let roughOffSamples: Sample[] = baseRoughEnv.roughOff;
+  let floorR: number = baseRoughEnv.floor;
+
+  /* ردیابی سطحِ واقعی تراش‌خورده برای محاسبهٔ امنِ جابه‌جایی‌های زیگزاگ — همانند   */
+  /* شبیه‌ساز، شعاع باقی‌ماندهٔ قطعه پس از هر برش به‌روز می‌شود تا شعاعِ عبورِ طولی  */
+  /* همیشه بالاتر از موادِ موجود باشد.                                             */
+  let physStock: { a: number; b: number; r: number }[] = [{ a: 0, b: p.blankL, r: envRot.outR }];
+  const physCut = (a: number, b: number, r: number) => {
+    const lo = Math.max(0, Math.min(a, b));
+    const hi = Math.min(p.blankL, Math.max(a, b));
+    if (hi - lo <= 1e-7) return;
+    const next: { a: number; b: number; r: number }[] = [];
+    const pushSeg = (sa: number, sb: number, sr: number) => {
+      if (sb - sa <= 1e-7) return;
+      const last = next[next.length - 1];
+      if (last && Math.abs(last.b - sa) <= 1e-7 && Math.abs(last.r - sr) <= 1e-7) last.b = sb;
+      else next.push({ a: sa, b: sb, r: sr });
+    };
+    for (const seg of physStock) {
+      if (seg.r <= r + 1e-9 || seg.b <= lo + 1e-7 || seg.a >= hi - 1e-7) {
+        pushSeg(seg.a, seg.b, seg.r);
+        continue;
+      }
+      if (lo > seg.a + 1e-7) pushSeg(seg.a, lo, seg.r);
+      pushSeg(Math.max(seg.a, lo), Math.min(seg.b, hi), r);
+      if (seg.b > hi + 1e-7) pushSeg(hi, seg.b, seg.r);
+    }
+    physStock = next;
+  };
+  const minSafeRadius = (zFrom: number, zTo: number): number => {
+    const lo = Math.min(zFrom, zTo);
+    const hi = Math.max(zFrom, zTo);
+    let mx = 0;
+    if (hi - lo <= 2e-5) {
+      const zMid = 0.5 * (lo + hi);
+      for (const seg of physStock) {
+        if (zMid >= seg.a - 1e-7 && zMid <= seg.b + 1e-7 && seg.r > mx) mx = seg.r;
+      }
+      if (
+        roughOffSamples.length &&
+        zMid >= roughOffSamples[0].z - 1e-6 &&
+        zMid <= roughOffSamples[roughOffSamples.length - 1].z + 1e-6
+      ) {
+        const or = upperRadiusOnPoly(roughOffSamples, zMid);
+        if (or > mx) mx = or;
+      }
+    } else {
+      for (const seg of physStock) {
+        if (Math.min(seg.b, hi) - Math.max(seg.a, lo) > 1e-5 && seg.r > mx) mx = seg.r;
+      }
+      if (roughOffSamples.length) {
+        const minOffZ = roughOffSamples[0].z;
+        const maxOffZ = roughOffSamples[roughOffSamples.length - 1].z;
+        const cA = Math.max(lo, minOffZ);
+        const cB = Math.min(hi, maxOffZ);
+        if (cB - cA > 1e-5) {
+          const eps = Math.min(1e-4, 0.25 * (cB - cA));
+          mx = Math.max(
+            mx,
+            upperRadiusOnPoly(roughOffSamples, cA + eps),
+            upperRadiusOnPoly(roughOffSamples, cB - eps)
+          );
+          for (const s of roughOffSamples) {
+            if (s.z > cA + 1e-5 && s.z < cB - 1e-5 && s.r > mx) mx = s.r;
+          }
+        }
+      }
+    }
+    return mx + p.safety; // حداقل فاصله امن (پارامتر فاصله امن) بالای مواد
+  };
+
+  const radiusAt = (z: number): number => upperRadiusOnPoly(samples, z);
+
+  /* شعاع خط آفست (پروفایل + اضافه پرداخت) در هر z — مواد زیر این خط نباید خشن شوند */
+  const offsetRadiusAt = (z: number): number => upperRadiusOnPoly(roughOffSamples, z);
+
+  /* ایمنی اتصال مورب (Ramp): خط مستقیم از (fromR,fromZ) به (toR,toZ) فقط وقتی       */
+  /* مجاز است که در تمام طولش بالاتر از خط آفست بماند؛ در غیر این صورت با منحنی     */
+  /* اصلی تداخل کرده و آن را می‌تراشد — پس باید به مسیر امن G0 بازگشت.             */
+  const rampIsSafe = (fromZ: number, fromR: number, toZ: number, toR: number): boolean => {
+    if (!roughOffSamples.length) return true;
+    const minOffZ = roughOffSamples[0].z;
+    const maxOffZ = roughOffSamples[roughOffSamples.length - 1].z;
+    /* گام شعاعی خالص روی دیوارهٔ عمودی آفست (مثلاً پایین‌رفتن بین دو لایه درون شیار U) */
+    if (Math.abs(toZ - fromZ) < 1e-7) {
+      if (fromZ < minOffZ - 0.01 || fromZ > maxOffZ + 0.01) return true;
+      const minMoveR = Math.min(fromR, toR);
+      if (minMoveR < lowerRadiusOnPoly(roughOffSamples, fromZ) - 0.05) return false;
+      for (let i = 0; i < roughOffSamples.length - 1; i++) {
+        const a = roughOffSamples[i], b = roughOffSamples[i + 1];
+        const lo = Math.min(a.z, b.z), hi = Math.max(a.z, b.z);
+        if (fromZ > lo + 1e-6 && fromZ < hi - 1e-6) {
+          const t = (fromZ - a.z) / (b.z - a.z);
+          const rAt = a.r + (b.r - a.r) * t;
+          if (minMoveR < rAt - 0.05) return false;
+        }
+      }
+      return true;
+    }
+    const loZ = Math.min(fromZ, toZ);
+    const hiZ = Math.max(fromZ, toZ);
+    const clipA = Math.max(loZ, minOffZ);
+    const clipB = Math.min(hiZ, maxOffZ);
+    if (clipB - clipA <= 1e-6) return true;
+    const rampTol = Math.min(0.08, Math.max(0.03, 0.16 * OD));
+    const rampRAt = (z: number): number => fromR + (toR - fromR) * ((z - fromZ) / (toZ - fromZ));
+    const epsZ = Math.min(1e-4, 0.25 * (clipB - clipA));
+    const steps = Math.max(16, Math.ceil((clipB - clipA) / 1.0));
+    for (let i = 0; i <= steps; i++) {
+      const z = i === 0 ? clipA + epsZ : i === steps ? clipB - epsZ : clipA + (clipB - clipA) * (i / steps);
+      if (rampRAt(z) < offsetRadiusAt(z) - rampTol) return false;
+    }
+    /* بررسی دقیق در تمام رئوس پوش آفست (از جمله لبه‌های بالای دیواره‌های عمودی +۹۰° و −۹۰° و تیغه‌های باریک) */
+    for (const s of roughOffSamples) {
+      if (s.z <= clipA + 1e-5 || s.z >= clipB - 1e-5) continue;
+      if (rampRAt(s.z) < s.r - rampTol) return false;
+    }
+    return true;
+  };
+
+  const smartTransferApplies = (a: Sample, b: Sample, dense: Sample[], reverseDirection: boolean) => {
+    if (!p.smartTransferEnabled) return false;
+    const ia=dense.indexOf(a),ib=dense.indexOf(b);
+    /* فقط یک خط واقعی که در نمونه‌برداری موتور دست‌کم یک نقطه میانی هم‌خط داشته
+       باشد پذیرفته می‌شود؛ وترهای کوتاه سازنده قوس هرگز وارد این الگوریتم نمی‌شوند. */
+    if(ia<0||ib<0||Math.abs(ib-ia)<2)return false;
+    const dz=b.z-a.z,dr=b.r-a.r;
+    /* روی خطوط کوتاه‌تر از ۵mm انتقال مستطیلی ارزش حرکتی ندارد و فقط G0های
+       اضافه تولید می‌کند؛ طول دقیقاً ۵mm همچنان مجاز است. */
+    if(Math.hypot(dz,dr)<5-1e-9)return false;
+    /* علامت شیب مستقل از جهت پیمایش خط است: در حالت عادی فقط شیب مثبت و با
+       روشن‌بودن Reverse همان عملیات فقط شیب منفی پذیرفته می‌شود. خطوط افقی و
+       عمودی علامت مثبت/منفی ندارند و وارد الگوریتم انتقالی نمی‌شوند. */
+    const slopeSign=dz*dr;
+    if(reverseDirection?slopeSign>=-1e-12:slopeSign<=1e-12)return false;
+    const angle=Math.atan2(Math.abs(dr),Math.abs(dz))*180/Math.PI;
+    const lo=Math.min(p.smartTransferAngleMin,p.smartTransferAngleMax);
+    const hi=Math.max(p.smartTransferAngleMin,p.smartTransferAngleMax);
+    return angle>=lo-1e-9&&angle<=hi+1e-9;
+  };
+  const emitFinishingPath=(path:Sample[],dense:Sample[],kind:SegKind,feed:number,emitFirst=true,reverseDirection=false)=>{
+    if(!path.length)return;
+    if(emitFirst)mv(1,2*path[0].r,path[0].z,feed,kind);
+    for(let i=1;i<path.length;i++){
+      const a=path[i-1],b=path[i];
+      if(!smartTransferApplies(a,b,dense,reverseDirection)){
+        mv(1,2*b.r,b.z,feed,kind);
+        continue;
+      }
+      /* محورهای طراحی: ابتدا Y تا شعاع انتهای خط، سپس X تا طول انتها. برش از
+         انتها به ابتدا انجام می‌شود و بازگشت نیز با همان ترتیب Y سپس X است؛
+         همهٔ انتقال‌ها صرفاً G0 هستند. */
+      rawRapid(2*b.r,a.z);
+      rawRapid(2*b.r,b.z);
+      mv(1,2*a.r,a.z,feed,kind);
+      rawRapid(2*b.r,a.z);
+      rawRapid(2*b.r,b.z);
+    }
+  };
+  const profilePath = (kind: SegKind, feed: number, reverse=false) => {
+    const dense = kind === "finish" ? outerFinishPath : samples;
+    const source = kind === "finish" ? compactExactlyCollinear(dense) : dense;
+    const path = reverse ? [...source].reverse() : source;
+    emitFinishingPath(path,dense,kind,feed,true,reverse);
+  };
+
+  /* اجرای زنجیره عملیات (استراتژی تراش) */
+  let innerCleared = false; // آیا حفره داخل با خشن‌کاری خالی شده است؟
+  /* وقتی آفست مستقیماً به پرداخت داخل وصل می‌شود، پرداخت نباید دوباره
+     با G0 به نقطه شروع وارد شود. */
+  let innerFinishDirectReady = false;
+  /* اتصال افست داخل به پرداخت داخل مستقل از فعال بودن خشن داخل است. */
+  let innerOffsetToFinishReady = false;
+  /* پاس نهایی کف‌تراشی در صفحه Split همان پاس نخست خشن داخل است؛ مالکیت این
+     صفحه فقط به عملیاتی داده می‌شود که زودتر اجرا شده تا مسیرها هم‌پوشان نشوند. */
+  let splitPlaneAlreadyCut = false;
+  /* کمترین شعاع باقی‌مانده در انتهای خام پس از خشن شعاعی؛ کف‌تراشی بعدی فقط
+     بخش مرکز تا این مرز را می‌تراشد و وارد ناحیه‌ای که قبلاً خالی شده نمی‌شود. */
+  let radialRoughEndR: number | null = null;
+  /* اگر کف‌تراشی زودتر اجرا شود، خشن شعاعی فقط تا مرز آن به‌علاوه همپوشانی می‌رود. */
+  let bottomCoveredFromZ: number | null = null;
+  /* وضعیت اتصال مرحله‌ای کف به خشن داخل: +X امن انجام شده و Y/−X باقی است. */
+  let bottomToInnerRoughReady = false;
+  let bottomToInnerRoughDirect = false;
+  for (const op of p.ops) {
+    if (!op.on) continue;
+    curOpId = op.id;
+    curHolder = op.holder;
+    switch (op.type) {
+      /* گرد کردن گوشه‌ها — برای مقاطع غیر دایره‌ای: برداشت قسمت اضافی از        */
+      /* شعاع محیطی (دورترین گوشه) تا شعاع محاطی (قطر واقعی) تا مقطع دایره‌ای شود. */
+      /* برای مقطع دایره‌ای این عملیات بی‌اثر است.                                */
+      case "round": {
+        curOp = "round";
+        const envr = rotationalEnvelope(p.blankD, p.blankShape);
+        const roundCompShiftR =
+          op.toolComp?.enabled && op.toolComp.mode !== "G40"
+            ? -compContactPoint([0, 1], op.toolComp, makeCompToolShape(op.toolComp))[1]
+            : 0;
+        const targetRoundR = Math.max(0, R + roundCompShiftR);
+        if (envr.hasCorners && envr.outR > R + 0.02) {
+          const shName = BLANK_SHAPES.find((b) => b.id === p.blankShape)?.name ?? p.blankShape;
+          note(`ROUNDING CORNERS - ${f2(2 * envr.outR)} TO ${f2(2 * targetRoundR)} (ZIGZAG)`);
+          /* گرد کردنِ رفت‌وبرگشتی: جهت تراش در هر لایه معکوس می‌شود و ابزار     */
+          /* به‌جای جمع‌کردن و بازگشت به نقطه شروع، فقط با یک فرورفتن شعاعی در     */
+          /* انتهای همان مسیر، لایه بعد را در جهت مخالف ادامه می‌دهد.             */
+          const roundLayers: number[] = [];
+          let layer = envr.outR + roundCompShiftR - p.doc;
+          let guard = 0;
+          while (layer > targetRoundR + 1e-6 && guard < 40) {
+            roundLayers.push(layer);
+            layer -= p.doc;
+            guard++;
+          }
+          roundLayers.push(targetRoundR); // لایه پایانی دقیقاً روی قطر واقعی (با جبران شعاع در صورت فعال بودن)
+
+          let dir: 1 | -1 = op.reverse ? -1 : 1;
+          let atZ = 0;
+          for (let i = 0; i < roundLayers.length; i++) {
+            const r = roundLayers[i];
+            const startZ = dir === 1 ? -p.extraCutEachSide : p.blankL + p.extraCutEachSide;
+            const endZ = dir === 1 ? p.blankL + p.extraCutEachSide : -p.extraCutEachSide;
+            note(`ROUND LAYER X${f2(r)}${dir === -1 ? " (RETURN)" : ""}`);
+            if (i === 0) mv(0, retractX, startZ, 0, "rapid"); // موقعیت‌یابی امن اولیه
+            mv(1, 2 * r, startZ, p.feedRough * 0.7, "round"); // فرورفتن شعاعی
+            if (Math.abs(endZ - startZ) > 0.01) mv(1, 2 * r, endZ, p.feedRough, "round"); // تراش طولی
+            atZ = endZ;
+            dir = dir === 1 ? -1 : 1;
+          }
+          cornersCleared = true;
+          physCut(0, p.blankL, R); // گوشه‌ها برداشته شد — سطح مبنا از این پس قطر واقعی است
+          note(`ROUND DONE AT X${f2(targetRoundR)} (${shName})`);
+          if(!nextIsOuterPath(op.id)) mv(0,2*(targetRoundR+p.safety),atZ,0,"rapid");
+        }
+        break;
+      }
+      /* پیشانی‌تراشی */
+      case "face": {
+        curOp = "face";
+        if (!hasOuter) break;
+        if (R - r0 > 0.05) {
+          note("FACING");
+          let faceR = r0;
+          let faceZ = z0;
+          if (op.toolComp?.enabled && op.toolComp.mode !== "G40") {
+            const shape = makeCompToolShape(op.toolComp);
+            faceZ = z0 - compContactPoint([-1, 0], op.toolComp, shape)[0];
+            faceR = Math.max(0, r0 - compContactPoint([0, 1], op.toolComp, shape)[1]);
+          }
+          enterOuterPath(faceR,faceZ,p.feedRough*.8,"face");
+          if(!nextIsOuterPath(op.id)) mv(0,2*(Math.max(faceR,radiusAt(z0))+p.safety),faceZ,0,"rapid");
+        }
+        break;
+      }
+      /* کف‌تراشی — برداشت طول اضافی خام پشت صفحه دهانه (بین انتهای طرح و
+         انتهای خام) با هلدر داخل‌تراشی؛ اگر خام بلندتر از طرح نباشد بی‌اثر
+         است. هر گذر یک صفحه کامل از بیرون قطر تا نزدیک مرکز می‌تراشد. */
+      case "bottom": {
+        curOp = "bottom";
+        if (!hasOuter) break;
+        const bottomCompShiftZ =
+          op.toolComp?.enabled && op.toolComp.mode !== "G40"
+            ? -compContactPoint([1, 0], op.toolComp, makeCompToolShape(op.toolComp))[0]
+            : 0;
+        const bottomEndZ = Math.min(p.blankL, Math.max(0, bottomOperationEndZ + bottomCompShiftZ));
+        const excess = p.blankL - bottomEndZ;
+        if (excess > 0.05) {
+          note(`BOTTOM FACING - EXCESS ${f2(excess)} (HOLDER ${op.holder})`);
+          /* هر پاس از مرکز به بیرون (+Y) انجام می‌شود. اگر خشن شعاعی قبلاً
+             اجرا شده، فقط تا مرز مواد باقی‌مانده می‌رویم؛ ناحیه بیرونی پیش‌تر
+             پوشش داده شده و تراش دوباره آن ممنوع است. */
+          const fullOutsideR = cornersCleared ? R + p.safety : envRot.outR + p.safety;
+          const outsideR = radialRoughEndR == null
+            ? fullOutsideR
+            : Math.min(fullOutsideR, radialRoughEndR + p.bottomRoughOverlap);
+          const outsideD = 2 * outsideR;
+          const centerD = 0; // کف‌تراشی دقیقاً از خط محور (X/قطر صفر) آغاز می‌شود
+          const N = Math.max(1, Math.ceil(excess / p.innerDoc - 1e-9));
+          const depths = Array.from({ length: N }, (_, i) => (i === N - 1 ? bottomEndZ : p.blankL - (i + 1) * p.innerDoc));
+          const machiningDepths=depths.filter(zk=>!(Math.abs(zk-bottomEndZ)<0.05&&splitPlaneAlreadyCut));
+          const zigzagBottom=p.innerRoughMode!=="classic";
+          if(zigzagBottom)note(`BOTTOM SERPENTINE ${machiningDepths.length} PASSES - CUTS BOTH Y DIRECTIONS`);
+          /* ورود نخستین پاس روی محور است؛ در حالت دوطرفه، انتهای هر پاس دقیقاً
+             ابتدای پاس بعدی است و فقط با +X امن و سپس −X به عمق بعد می‌رود. */
+          const firstBottomForward=!op.reverse;
+          const firstBottomD=firstBottomForward?centerD:outsideD;
+          enterFirstInner(firstBottomD,(machiningDepths[0]??depths[0])+p.innerStartClearance);
+          for(let k=0;k<machiningDepths.length;k++){
+            const zk=machiningDepths[k],forward=zigzagBottom?(k%2===0?firstBottomForward:!firstBottomForward):firstBottomForward;
+            const startD=forward?centerD:outsideD,endD=forward?outsideD:centerD;
+            const isSplitPlane=Math.abs(zk-bottomEndZ)<0.05;
+            if(k===0){
+              if(Math.abs(p.innerStartClearance)>1e-9)mv(1,startD,zk,p.feedRough*.8,"bottom");
+            }else if(zigzagBottom){
+              /* اتصال پاس‌های زیگزاگ مستقیم و برشی است: ابزار در همان Y از
+                 انتهای پاس قبلی مستقیماً در −X به عمق بعد می‌رود. حرکت امن +X
+                 فقط برای اتصال نهایی کف‌تراشی به خشن داخل نگه داشته می‌شود. */
+              mv(1,startD,zk,p.feedRough*.7,"bottom");
+            }else{
+              const prevZ=machiningDepths[k-1];
+              const resetD=firstBottomForward?centerD:outsideD;
+              rawRapid(resetD,prevZ+.5);
+              mv(1,resetD,zk,p.feedRough*.7,"bottom");
+            }
+            mv(1,endD,zk,p.feedRough*.8,"bottom");
+            if(isSplitPlane&&hasInner)splitPlaneAlreadyCut=true;
+          }
+          if (!finishLastInner(op.id)) {
+            if (nextEnabledOp(op.id)?.type === "inner-rough") {
+              if (p.safeBottomInnerLink) {
+                /* مرحله اول اتصال امن؛ Y و −X در آغاز خشن داخل تولید می‌شوند. */
+                rawRapid(cur.x, cur.z + p.safety);
+                bottomToInnerRoughReady = true;
+              } else {
+                /* هیچ حرکت واسطی اینجا ساخته نمی‌شود؛ اولین G1 خشن داخل مستقیماً
+                   از انتهای آخرین پاس کف به نقطه شروع آن متصل خواهد شد. */
+                bottomToInnerRoughDirect = true;
+              }
+            } else if (nextIsInnerPath(op.id)) moveInnerToAxisSafely();
+            else mv(0, retractX, bottomEndZ, 0, "rapid");
+          }
+          physCut(bottomEndZ, p.blankL, 0); // طول اضافی کاملاً برداشته شد
+          bottomCoveredFromZ = bottomEndZ;
+        }
+        break;
+      }
+      /* خشن شعاعی — لایه‌های قطری با حرکت طولی (G71)                            */
+      /* حالت رفت‌وبرگشتی (زیگزاگ): جهت تراش در هر برش معکوس می‌شود و ابزار پس از  */
+      /* پایان یک مسیر، به‌جای جمع‌کردن کامل و بازگشت به نقطه شروع، با حداقل       */
+      /* جابه‌جاییِ امنِ شعاعی (فقط تا بالای موادِ موجود) مستقیماً از انتهای همان    */
+      /* مسیر، مسیر بعدی را در جهت مخالف ادامه می‌دهد.                              */
+      case "rough-d": {
+        curOp = "rough-d";
+        if (!hasOuter) break;
+        ({ roughOff: roughOffSamples, floor: floorR } = buildRoughOffForComp(op.toolComp));
+        /* قانون متقارن: کف‌تراشیِ قبلی بازه zEnd..blankL را برداشته است؛ خشن
+           شعاعی فقط تا zEnd+همپوشانی ادامه می‌یابد، نه روی کل ناحیه خالی‌شده. */
+        const radialEndZ = bottomCoveredFromZ == null
+          ? p.blankL
+          : Math.min(p.blankL, bottomCoveredFromZ + p.bottomRoughOverlap);
+        const roughStartZ=-p.extraCutEachSide;
+        const roughEndZ=radialEndZ+p.extraCutEachSide;
+        /* برش دقیق پوش بالایی تا مرز radialEndZ با حفظ دیواره‌های عمودی */
+        const insideRoughRun: Sample[] = [];
+        for (let i = 0; i < roughOffSamples.length; i++) {
+          const curPt = roughOffSamples[i];
+          if (curPt.z >= -1e-9 && curPt.z <= radialEndZ + 1e-9) {
+            insideRoughRun.push({ ...curPt });
+          } else if (i > 0) {
+            const prevPt = roughOffSamples[i - 1];
+            if (prevPt.z < -1e-9 && curPt.z >= -1e-9 && Math.abs(curPt.z - prevPt.z) > 1e-9) {
+              const t0 = (0 - prevPt.z) / (curPt.z - prevPt.z);
+              insideRoughRun.push({ z: 0, r: prevPt.r + (curPt.r - prevPt.r) * t0 });
+            }
+            if (prevPt.z <= radialEndZ + 1e-9 && curPt.z > radialEndZ + 1e-9 && Math.abs(curPt.z - prevPt.z) > 1e-9) {
+              const t1 = (radialEndZ - prevPt.z) / (curPt.z - prevPt.z);
+              insideRoughRun.push({ z: radialEndZ, r: prevPt.r + (curPt.r - prevPt.r) * t1 });
+              break;
+            }
+          }
+        }
+        if (!insideRoughRun.length || insideRoughRun[insideRoughRun.length - 1].z < radialEndZ - 1e-9) {
+          insideRoughRun.push({ z: radialEndZ, r: upperRadiusOnPoly(roughOffSamples, Math.max(0, radialEndZ - 1e-4)) });
+        }
+        /* امتداد دو سر با شعاع مرزیِ سمت داخلِ قطعه تا پشت صفحهٔ سه‌نظام (X<0) بیش‌تراشی نشود */
+        const firstR = upperRadiusOnPoly(insideRoughRun, Math.min(radialEndZ, 1e-4));
+        const boundaryLastR = upperRadiusOnPoly(insideRoughRun, Math.max(0, radialEndZ - 1e-4));
+        const roughRunSamples:Sample[]=[
+          ...(roughStartZ < (insideRoughRun[0]?.z ?? 0) - 1e-9 ? [{z:roughStartZ,r:firstR}] : []),
+          ...insideRoughRun,
+          ...(roughEndZ > (insideRoughRun[insideRoughRun.length - 1]?.z ?? radialEndZ) + 1e-9 ? [{z:roughEndZ,r:boundaryLastR}] : []),
+        ];
+
+        /* ------------------------------------------------------------------ */
+        /* حالت رفت‌وبرگشتی (زیگزاگ) — مارپیچ دنبال‌کنندهٔ منحنی، فقط بازه‌های فعال:  */
+        /* در هر گذر j فقط بازه‌هایی طی می‌شوند که هنوز به برش نیاز دارند (جایی که  */
+        /* پروفایل+آفست از لایهٔ قبل پایین‌تر است)؛ نواحیِ تمام‌شده دوباره تراش      */
+        /* نمی‌خورند. گذرِ رفت در یک جهت و گذرِ برگشت در جهت مخالف، هر دو باربرداری  */
+        /* می‌کنند. درون هر بازه ابزار منحنی  C(z)=max(پروفایل+آفست، شعاع‌لایه) را   */
+        /* دنبال می‌کند (نرم از روی قله و دره) و برای ردشدن از ناحیهٔ تمام‌شدهٔ بین */
+        /* دو بازه، یک عبور امنِ کوتاه کمی بالاتر از پروفایل انجام می‌شود. چون هر   */
+        /* گذر فقط به عمق «doc» برش می‌زند، نیروی برش پخش شده و برای چوب شکننده امن */
+        /* است و از رفت‌وآمد تکراری روی نواحی تمام‌شده جلوگیری می‌شود.             */
+        /* ------------------------------------------------------------------ */
+        if (p.roughMode === "zigzag") {
+          note("ROUGHING - CONTOUR SERPENTINE (ACTIVE REGIONS, CUTS BOTH WAYS)");
+          const F = roughRunSamples;
+          let minF = Infinity;
+          for (const s of F) if (s.r < minF) minF = s.r;
+          const totalDepth = R - minF;
+          if (totalDepth > 0.02) {
+            const N = Math.max(1, Math.ceil(totalDepth / p.doc - 1e-9));
+            /* بیشینهٔ پروفایل آفست در یک بازهٔ طولی — برای عبور امن از ناحیهٔ تمام‌شده */
+            const maxFIn = (a: number, b: number) => {
+              let mx = -Infinity;
+              for (const s of F) if (s.z >= a - 0.01 && s.z <= b + 0.01 && s.r > mx) mx = s.r;
+              return mx === -Infinity ? minF : mx;
+            };
+            /* حذف نقاط نمونه‌برداری زائد از هر پاس. منحنی‌های ورودی برای نمایش
+               نرم با صدها Sample ساخته می‌شوند، اما تبدیل مستقیم هر Sample به G1
+               مسیر خشن زیگزاگ را بی‌دلیل به تعداد زیادی خط می‌شکست. RDP با تلرانس
+               ۰٫۰۲mm شکل عملیاتی را حفظ و بخش‌های مستقیم را یک خط می‌کند. */
+            const simplifyPass = (pts: { z: number; r: number }[]): { z: number; r: number }[] => {
+              if (pts.length <= 2) return pts;
+              const keep = new Uint8Array(pts.length); keep[0] = 1; keep[pts.length - 1] = 1;
+              const stack: [number, number][] = [[0, pts.length - 1]];
+              while (stack.length) {
+                const [a, b] = stack.pop()!; const A = pts[a], B = pts[b];
+                const dz = B.z - A.z, dr = B.r - A.r, den = dz * dz + dr * dr;
+                let best = 0, at = -1;
+                for (let i = a + 1; i < b; i++) {
+                  const t = den > 1e-18 ? Math.max(0, Math.min(1, ((pts[i].z - A.z) * dz + (pts[i].r - A.r) * dr) / den)) : 0;
+                  const ez = pts[i].z - (A.z + t * dz), er = pts[i].r - (A.r + t * dr);
+                  const d = Math.hypot(ez, er); if (d > best) { best = d; at = i; }
+                }
+                if (at >= 0 && best > 0.02) { keep[at] = 1; stack.push([a, at], [at, b]); }
+              }
+              return pts.filter((_, i) => keep[i]);
+            };
+            /* جهت شروع: نزدیک‌تر به موقعیت فعلی ابزار (مثلاً پایان گرد کردن) */
+            /* جهت خشن شعاعی فقط از Reverse خود همین عملیات می‌آید؛ موقعیت باقی‌مانده
+             از گرد کردن گوشه‌ها نباید آن را ناخواسته معکوس کند. */
+            let forward = !op.reverse;
+            let first = true;
+            let lastEndZ = NaN;
+            let lastEndR = 0;
+            for (let j = 1; j <= N; j++) {
+              const prevLayer = R - (j - 1) * p.doc;
+              const layer = R - j * p.doc;
+              /* بازه‌های فعال این گذر: جایی که هنوز به برش نیاز است */
+              const activeRaw = cutIntervals(F, prevLayer);
+              if (!activeRaw.length) break;
+              note(`SERPENTINE PASS ${j}/${N} - X${f2(layer)}${forward ? "" : " (RETURN)"}`);
+              /* گذرِ رفت چپ→راست و گذرِ برگشت راست→چپ؛ بازه‌ها هم در همان جهت طی می‌شوند */
+              const active = forward ? activeRaw : [...activeRaw].reverse();
+              for (const iv of active) {
+                const startZ = forward ? iv.a : iv.b;
+                const endZ = forward ? iv.b : iv.a;
+                const inDir = forward ? 1 : -1;
+                const cStart = Math.max(upperRadiusOnPoly(F, startZ + inDir * 1e-4), layer);
+                if (first) {
+                  enterOuterPath(cStart,startZ,p.feedRough*.7,"rough");
+                  first = false;
+                } else {
+                  /* عبور امن از ناحیهٔ تمام‌شدهٔ بین دو بازه — با حداقل فاصله امن (+Y)   */
+                  /* بالای خط آفست؛ اگر گوشه‌ها هنوز گرد نشده‌اند، بیرون پوشش دورانی. */
+                  const loZ = Math.min(lastEndZ, startZ);
+                  const hiZ = Math.max(lastEndZ, startZ);
+                  const clearR = Math.max(maxFIn(loZ, hiZ) + p.safety, cornersCleared ? 0 : envRot.outR + p.safety);
+                  const travelR = Math.max(lastEndR, clearR);
+                  if (travelR > lastEndR + 1e-6) rawRapid(2 * travelR, lastEndZ);
+                  rawRapid(2 * travelR, startZ);
+                }
+                /* فرورفتن تا منحنی لایه در نقطهٔ ورود و دنبال‌کردن منحنی درون بازه */
+                mv(1, 2 * cStart, startZ, p.feedRough * 0.7, "rough");
+                const lo = Math.min(startZ, endZ);
+                const hi = Math.max(startZ, endZ);
+                const ptsIn = F.filter((s) => s.z > lo + 1e-6 && s.z < hi - 1e-6);
+                const ordered = forward ? ptsIn : [...ptsIn].reverse();
+                const cEnd = Math.max(upperRadiusOnPoly(F, endZ - inDir * 1e-4), layer);
+                const pass = simplifyPass([
+                  { z: startZ, r: cStart },
+                  ...ordered.map((s) => ({ z: s.z, r: Math.max(s.r, layer) })),
+                  { z: endZ, r: cEnd },
+                ]);
+                for (let i = 1; i < pass.length; i++) mv(1, 2 * pass[i].r, pass[i].z, p.feedRough, "rough");
+                lastEndZ = endZ;
+                lastEndR = cEnd;
+              }
+              forward = !forward; // گذر بعد در جهت مخالف
+            }
+            if (!Number.isNaN(lastEndZ)) {
+              if(!nextIsOuterPath(op.id)) mv(0,2*(lastEndR+p.safety),lastEndZ,0,"rapid");
+              /* گذر آخر زیگزاگ تا خط آفست واقعی می‌رسد. */
+              radialRoughEndR = offsetRadiusAt(radialEndZ);
+            }
+          }
+          break;
+        }
+
+        note(
+          p.roughMode === "zone"
+            ? "ROUGHING - RADIAL LAYERS (BY ZONE)"
+            : "ROUGHING - RADIAL LAYERS"
+        );
+        if (p.ramp) note("CONTINUOUS RAMP LINKS - NO G0 BETWEEN PASSES");
+
+        /* فهرست برش‌ها — به ترتیب لایه (کلاسیک) یا به ترتیب ناحیه (ناحیه‌ای:      */
+        /* همهٔ لایه‌های ناحیهٔ اول، سپس همهٔ لایه‌های ناحیهٔ دوم و …)                  */
+        const cuts: { a: number; b: number; r: number; forward?: boolean }[] = [];
+        if (p.roughMode === "zone") {
+          /* نواحی: مرزهای دستی کاربر (در صورت اعتبار) جایگزین تقسیم خودکار می‌شوند؛ */
+          /* سپس ترتیب دستی (در صورت اعتبار) روی همان نواحی اعمال می‌شود.            */
+          let zones = resolveZones(roughRunSamples, p.zoneBounds, roughStartZ, roughEndZ);
+          const ord = p.zoneOrder;
+          const isPerm =
+            ord.length === zones.length &&
+            ord.every((v) => v >= 0 && v < zones.length) &&
+            new Set(ord).size === zones.length;
+          if (isPerm) {
+            zones = ord.map((i) => zones[i]);
+          } else {
+            /* جهت نواحی فقط از Reverse خود خشن شعاعی می‌آید؛ موقعیت ابزار بعد از
+               عملیات گرد کردن گوشه‌ها نباید ترتیب نواحی را معکوس کند. */
+            if (op.reverse) zones = [...zones].reverse();
+          }
+          for (const zone of zones) {
+            let layer = R - p.doc;
+            let layerNo = 0;
+            let guard = 0;
+            while (layer > floorR + 1e-6 && guard < 80) {
+              guard++;
+              /* در حالت ناحیه‌ای هر لایه جهت مخالف لایه قبل را طی می‌کند.
+                 بنابراین در برگشت نیز خود خطوط برش می‌خورند، نه اینکه فقط با
+                 حرکت سریع به ابتدای خط بعدی برگردیم؛ مخصوصاً بین دو بازه‌ای که
+                 یک قله آن‌ها را از هم جدا کرده است. */
+              const forward = ((layerNo & 1) === 0) !== op.reverse;
+              const intervals = cutIntervals(roughRunSamples, layer)
+                .map(iv => ({ a: Math.max(iv.a, zone.a), b: Math.min(iv.b, zone.b) }))
+                .filter(iv => iv.b - iv.a > 0.3);
+              if (!forward) intervals.reverse();
+              for (const iv of intervals) cuts.push({ ...iv, r: layer, forward });
+              layerNo++;
+              layer -= p.doc;
+            }
+          }
+        } else {
+          let layer = R - p.doc;
+          let guard = 0;
+          while (layer > floorR + 1e-6 && guard < 80) {
+            guard++;
+            for (const iv of cutIntervals(roughRunSamples, layer)) cuts.push({ a: iv.a, b: iv.b, r: layer });
+            layer -= p.doc;
+          }
+        }
+
+        /* مرز واقعی باقی‌مانده در انتهای خام پس از آخرین لایه خشن؛ این مقدار
+           مبنای حذف فقط بخش تکراری از کف‌تراشی بعدی است. */
+        const endCutR = cuts
+          .filter((c) => c.a <= radialEndZ + 1e-6 && c.b >= radialEndZ - 1e-6)
+          .reduce((best, c) => Math.min(best, c.r), Infinity);
+        if (Number.isFinite(endCutR)) radialRoughEndR = endCutR;
+
+        if (p.roughMode === "classic") {
+          /* روش کلاسیکِ یک‌طرفه */
+          let nL = 0;
+          let lastR = NaN;
+          for (const c of cuts) {
+            if (c.r !== lastR) {
+              nL++;
+              note(`LAYER ${nL} - X${f2(c.r)}`);
+              lastR = c.r;
+            }
+            const startZ=op.reverse?c.b:c.a,endZ=op.reverse?c.a:c.b;
+            enterOuterPath(c.r,startZ,p.feedRough*.7,"rough");
+            if (c.b - c.a > 0.01) mv(1, 2 * c.r, endZ, p.feedRough, "rough");
+          }
+          break;
+        }
+
+        /* روش رفت‌وبرگشتی با انتخاب حریصانهٔ نزدیک‌ترین نقطهٔ ورود — ابزار همیشه   */
+        /* از نزدیک‌ترین انتهای مسیرِ بعدی وارد می‌شود تا جابه‌جاییِ طولی حداقل شود  */
+        /* و بدون بازگشت به نقطه شروع، مسیرها به‌صورت مارپیچ طی شوند.               */
+        let curZ = NaN; // موقعیت طولی فعلی ابزار
+        let curR = 0; // شعاع فعلی ابزار
+        let nL = 0;
+        let lastR = NaN;
+        for (const c of cuts) {
+          if (c.r !== lastR) {
+            nL++;
+            note(`LAYER ${nL} - X${f2(c.r)}`);
+            lastR = c.r;
+          }
+          /* نزدیک‌ترین نقطهٔ ورود به مکان فعلی ابزار — برای اولین برش، موقعیت      */
+          /* واقعی ابزار (cur.z) مرجع است؛ اگر عملیات قبلی (مثل گرد کردن گوشه‌ها)   */
+          /* ابزار را در انتهای خاصی رها کرده باشد، از همان‌جا ادامه می‌یابد و به   */
+          /* نقطهٔ خانه بازنمی‌گردد. در ابتدای برنامه cur همان نقطهٔ خانه است.      */
+          const firstCut=Number.isNaN(curZ);
+          const refZ = firstCut ? cur.z : curZ;
+          const nearA=Math.abs(c.a-refZ)<=Math.abs(c.b-refZ);
+          /* اولین ورود جهت خود خشن شعاعی را تعیین می‌کند، نه نزدیک‌ترین
+             انتهای باقی‌مانده از عملیات قبلی مثل گرد کردن گوشه‌ها. */
+          const prescribedDirection = p.roughMode === "zone" && c.forward !== undefined;
+          const startZ = prescribedDirection
+            ? (c.forward ? c.a : c.b)
+            : (firstCut ? (op.reverse ? c.b : c.a) : (nearA ? c.a : c.b));
+          const endZ = prescribedDirection
+            ? (c.forward ? c.b : c.a)
+            : (startZ === c.a ? c.b : c.a);
+
+          /* ایمنی اتصال مورب: اگر خط مستقیمِ بین انتهای مسیر قبل و ابتدای خط بعد   */
+          /* با خط آفست (و در نتیجه منحنی اصلی) تداخل داشته باشد، اتصال پیوسته      */
+          /* لغو و از مسیر امن G0 استفاده می‌شود تا شکل اصلی تراشیده نشود.          */
+          /* روی منحنی‌های محدب یکنواخت (مثل قوس داخلی و پیاله)، اگر تک‌وتر مستقیم به‌خاطر
+             برآمدگی ملایم قوس بیش از تلرانس به آفست نزدیک شود اما هیچ قله، پلهٔ عمودی
+             (+۹۰°/−۹۰°) یا مادهٔ تراش‌نخورده‌ای در مسیر نباشد، اتصال پیوستهٔ G1 روی پوش
+             بیرونی آفست با کمترین تعداد وتر متقارن (RDP) ساخته می‌شود تا G0 اضافه صادر نشود. */
+          const buildConvexRampPath = (fromZ: number, fromR: number, toZ: number, toR: number): Sample[] | null => {
+            if (!p.ramp || toR > fromR + 1e-6 || Math.abs(toZ - fromZ) <= 1e-6) return null;
+            if (!roughOffSamples.length) return null;
+            const minOffZ = roughOffSamples[0].z;
+            const maxOffZ = roughOffSamples[roughOffSamples.length - 1].z;
+            if (fromZ < minOffZ - 0.05 || fromZ > maxOffZ + 0.05 || toZ < minOffZ - 0.05 || toZ > maxOffZ + 0.05) return null;
+            if (Math.abs(offsetRadiusAt(fromZ) - fromR) > 0.2 || Math.abs(offsetRadiusAt(toZ) - toR) > 0.2) return null;
+            const loZ = Math.min(fromZ, toZ);
+            const hiZ = Math.max(fromZ, toZ);
+            for (const seg of physStock) {
+              if (Math.min(seg.b, hiZ) - Math.max(seg.a, loZ) > 1e-5 && seg.r > fromR + 0.05) return null;
+            }
+            for (let i = 0; i < roughOffSamples.length - 1; i++) {
+              const a = roughOffSamples[i], b = roughOffSamples[i + 1];
+              if (Math.max(a.z, b.z) < loZ + 1e-5 || Math.min(a.z, b.z) > hiZ - 1e-5) continue;
+              if (Math.abs(b.z - a.z) <= 1e-6 && Math.abs(b.r - a.r) > 0.05) return null;
+            }
+            const dir = toZ > fromZ ? 1 : -1;
+            const innerVerts = roughOffSamples
+              .filter((s) => s.z > loZ + 1e-4 && s.z < hiZ - 1e-4)
+              .sort((a, b) => (a.z - b.z) * dir);
+            let prevR = fromR;
+            const chain: Sample[] = [{ z: fromZ, r: fromR }];
+            for (const v of innerVerts) {
+              if (v.r > fromR + 0.02 || v.r < toR - 0.02) return null;
+              if (v.r > prevR + 0.02) return null;
+              prevR = Math.min(prevR, v.r);
+              chain.push({ z: v.z, r: Math.min(fromR, Math.max(toR, v.r + 0.01)) });
+            }
+            chain.push({ z: toZ, r: toR });
+            const simplifySafe = (pts: Sample[]): Sample[] | null => {
+              const first = pts[0], last = pts[pts.length - 1];
+              if (rampIsSafe(first.z, first.r, last.z, last.r)) return [first, last];
+              if (pts.length <= 2) return null;
+              let bestIdx = Math.floor(pts.length / 2);
+              let bestBulge = -Infinity;
+              const dz = last.z - first.z;
+              for (let i = 1; i < pts.length - 1; i++) {
+                const chordR = Math.abs(dz) > 1e-9
+                  ? first.r + (last.r - first.r) * ((pts[i].z - first.z) / dz)
+                  : 0.5 * (first.r + last.r);
+                const bulge = pts[i].r - chordR;
+                if (bulge > bestBulge) {
+                  bestBulge = bulge;
+                  bestIdx = i;
+                }
+              }
+              const left = simplifySafe(pts.slice(0, bestIdx + 1));
+              if (!left) return null;
+              const right = simplifySafe(pts.slice(bestIdx));
+              if (!right) return null;
+              return [...left.slice(0, -1), ...right];
+            };
+            const simplified = simplifySafe(chain);
+            return simplified && simplified.length >= 2 ? simplified.slice(1) : null;
+          };
+
+          const rampOk = !Number.isNaN(curZ) && rampIsSafe(curZ, curR, startZ, c.r);
+          const convexRamp = !Number.isNaN(curZ) && !rampOk ? buildConvexRampPath(curZ, curR, startZ, c.r) : null;
+          if (Number.isNaN(curZ)) {
+            enterOuterPath(c.r,startZ,p.feedRough*.7,"rough");
+            mv(1, 2 * c.r, startZ, p.feedRough * 0.7, "rough");
+          } else if (rampOk) {
+            mv(1, 2 * c.r, startZ, p.feedRough * 0.7, "rough");
+          } else if (convexRamp && convexRamp.length) {
+            for (const wp of convexRamp) mv(1, 2 * wp.r, wp.z, p.feedRough * 0.7, "rough");
+          } else {
+            /* جابه‌جایی امن: شعاع عبور با حداقل فاصله امن بالای تمام موادِ مسیر است */
+            const safeR = minSafeRadius(curZ, startZ);
+            const travelR = Math.max(curR, safeR);
+            if (travelR > curR + 1e-6) rawRapid(2 * travelR, curZ); // جمع شعاعیِ جزئی (در صورت نیاز)
+            rawRapid(2 * travelR, startZ); // جابه‌جایی طولیِ امن — بدون بازگشت به شروع
+            mv(1, 2 * c.r, startZ, p.feedRough * 0.7, "rough");
+          }
+          if (Math.abs(endZ - startZ) > 0.01) mv(1, 2 * c.r, endZ, p.feedRough, "rough");
+          physCut(c.a, c.b, c.r); // به‌روزرسانی سطح تراش‌خورده
+
+          curZ = endZ;
+          curR = c.r;
+        }
+        if (!Number.isNaN(curZ) && !nextIsOuterPath(op.id)) mv(0,2*(curR+p.safety),curZ,0,"rapid");
+        break;
+      }
+      /* خشن محوری — فرورفتن شعاعی در گام‌های طولی (G72) */
+      case "rough-z": {
+        curOp = "rough-z";
+        if (!hasOuter) break;
+        ({ roughOff: roughOffSamples, floor: floorR } = buildRoughOffForComp(op.toolComp));
+        note("ROUGHING - AXIAL PEEL");
+        const stepZ = Math.max(0.5, p.doc);
+        let nP = 0;
+        const axialPositions:number[]=[];
+        for(let z=z0;z<=zEnd+1e-6;z+=stepZ)axialPositions.push(z);
+        if(op.reverse)axialPositions.reverse();
+        for (const z of axialPositions) {
+          const target = offsetRadiusAt(z);
+          if (target < R - 0.02) {
+            if (nP === 0) note(`AXIAL STEP ${f2(stepZ)} MM`);
+            nP++;
+            mv(0, retractX, z, 0, "rapid");
+            mv(1, 2 * target, z, p.feedRough * 0.8, "roughz");
+            mv(0, retractX, z, 0, "rapid");
+          }
+        }
+        break;
+      }
+      /* کپی‌تراشی — مسیرهای موازی با خط طرح */
+      case "copy": {
+        curOp = "copy";
+        if (!hasOuter) break;
+        ({ roughOff: roughOffSamples, floor: floorR } = buildRoughOffForComp(op.toolComp));
+        note("ROUGHING - CONTOUR PARALLELS");
+        const kMax = Math.floor((R - floorR - 1e-6) / p.doc);
+        for (let k = kMax; k >= 1; k--) {
+          const d = OD + k * p.doc;
+          const rawPar = normalOffset(samples, d, true);
+          const compPar = op.toolComp?.enabled && op.toolComp.mode !== "G40"
+            ? compensateOuterPolyline(rawPar, op.toolComp, true)
+            : rawPar;
+          const parEnv = buildRadialUpperEnvelope(compPar);
+          const ivs = cutIntervals(parEnv, R);
+          if (!ivs.length) continue;
+          note(`CONTOUR +${f2(d)} MM`);
+          const orderedIvs = op.reverse ? [...ivs].reverse() : ivs;
+          for (const iv of orderedIvs) {
+            const rLeft = Math.min(R, upperRadiusOnPoly(parEnv, iv.a + 1e-4));
+            const rRight = Math.min(R, upperRadiusOnPoly(parEnv, iv.b - 1e-4));
+            const midPts = parEnv
+              .filter((s) => s.z > iv.a + 1e-6 && s.z < iv.b - 1e-6)
+              .map((s) => ({ z: s.z, r: Math.min(R, s.r) }));
+            const fullSpan = compactExactlyCollinear([
+              { z: iv.a, r: rLeft },
+              ...midPts,
+              { z: iv.b, r: rRight },
+            ]);
+            if (fullSpan.length < 2) continue;
+            const pts = op.reverse ? [...fullSpan].reverse() : fullSpan;
+            mv(0, retractX, pts[0].z, 0, "rapid");
+            mv(1, 2 * pts[0].r, pts[0].z, p.feedRough * 0.7, "copy");
+            for (let i = 1; i < pts.length; i++) mv(1, 2 * pts[i].r, pts[i].z, p.feedRough, "copy");
+            mv(0, retractX, pts[pts.length - 1].z, 0, "rapid");
+          }
+        }
+        break;
+      }
+      /* خشن داخل کاسه — خالی‌کردن پلکانی از دهانه به سمت کف                   */
+      /* هر گذر: فرورفتن محوری کوتاه در مرکز + روتراشی تا دیواره داخلی. این       */
+      /* عملیات با هلدر دوم اجرا می‌شود و مختصات آن در پس‌پردازنده با درنظرگرفتن */
+      /* چرخش ‎−۹۰°‎ و آفست‌های هلدر دوم تبدیل می‌شود.                           */
+      case "inner-rough": {
+        curOp = "inner-rough";
+        if (!hasInner) break;
+        note(`INNER ROUGH - BOWL HOLLOWING (HOLDER ${op.holder})`);
+        const activeInnerOffSamples =
+          op.toolComp?.enabled && op.toolComp.mode !== "G40"
+            ? compensateInnerPolyline(innerFinishOffSamples, op.toolComp)
+            : innerFinishOffSamples;
+        /* ترانهادهٔ منطق خشن شعاعی: پروفیل آفست به‌صورت X=f(R) خوانده
+           می‌شود و هر پاس در X ثابت، بازه‌های شعاعی مجاز را عمودی می‌تراشد. */
+        const wallByR: Sample[] = activeInnerOffSamples
+          .map((point) => ({ ...point, r: Math.max(0, point.r) }))
+          .sort((a, b) => a.r - b.r);
+        const mergedWall: Sample[] = [];
+        for (const point of wallByR) {
+          const last = mergedWall[mergedWall.length - 1];
+          if (last && Math.abs(last.r - point.r) < 0.04) {
+            /* راست‌ترین مرز محافظه‌کارانه است و اجازه ورود به قله را نمی‌دهد. */
+            if (point.z > last.z) last.z = point.z;
+          } else mergedWall.push({ ...point });
+        }
+        if (mergedWall.length < 2) break;
+        /* حفره از محور دوران آغاز می‌شود. اگر Offset نرمالِ نقطه انتهایی، اولین
+           نمونه را اندکی از R=0 دور کرده باشد، همان مرز تا محور امتداد می‌یابد. */
+        if (mergedWall[0].r > 1e-9) mergedWall.unshift({ z: mergedWall[0].z, r: 0 });
+        const zOuter = Math.max(...mergedWall.map((point) => point.z));
+        const zInner = Math.min(...mergedWall.map((point) => point.z));
+        /* خشن‌کاری باید کاملاً در سمت حفرهٔ خط آفست بماند. این کلیرنس کوچک
+           محاسباتی مانع می‌شود مرکز مسیر یا خطای اعشاری وارد ناحیه رزرو آفست شود. */
+        const roughOffsetClearance = 0.05;
+        const roughInnerZ = zInner + roughOffsetClearance;
+        const step = Math.max(0.5, p.innerDoc);
+        const layers: number[] = [];
+        /* اگر کف‌تراشی پیش از خشن داخل اجرا شده، سطح واقعی آخرین پاس کف مبنای
+           اولین عمق است. بنابراین فاصلهٔ قابل تنظیم کف تا آفست به لایه‌های DOC
+           تقسیم و کاملاً توسط خشن داخل پر می‌شود؛ شروع همیشه از zOuter باعث
+           باقی‌ماندن این فاصله به‌صورت مادهٔ تراش‌نخورده می‌شد. */
+        const firstLayer = bottomCoveredFromZ != null
+          ? bottomCoveredFromZ - step
+          : splitPlaneAlreadyCut ? zOuter - step : zOuter;
+        for (let z = firstLayer; z > roughInnerZ + 0.05; z -= step) layers.push(z);
+        if (!layers.length || Math.abs(layers[layers.length - 1] - roughInnerZ) > 0.05) layers.push(roughInnerZ);
+        if (!splitPlaneAlreadyCut && Math.abs(layers[0] - zOuter) < 0.05) splitPlaneAlreadyCut = true;
+
+        /* همان چندضلعی لایه «محدوده داخل‌تراشی» در ProfileEditor: انتهای
+           Offset نزدیک Split → +X → محور → −X → سر محوری Offset → Offset. */
+        const rawBoundary=activeInnerOffSamples.map(q=>({r:Math.max(0,q.r),z:q.z}));
+        const boundary=rawBoundary[0].r<=rawBoundary[rawBoundary.length-1].r?rawBoundary:[...rawBoundary].reverse();
+        const axisEnd=boundary[0],splitEnd=boundary[boundary.length-1],mouthPlaneZ=Math.max(p.blankL,splitEnd.z);
+        const polygon=[splitEnd,{r:splitEnd.r,z:mouthPlaneZ},{r:0,z:mouthPlaneZ},{r:0,z:axisEnd.z},...boundary];
+        /* فهرست مکانی لبه‌ها بر اساس Z: بیشتر مقاطع افقی فقط با چند لبه از
+           صدها لبه مرز برخورد دارند. نتیجه دقیق همان است، اما پیمایش کامل حذف می‌شود. */
+        const polyMinZ=Math.min(...polygon.map(q=>q.z)),polyMaxZ=Math.max(...polygon.map(q=>q.z)),bucketCount=96,bucketSpan=Math.max(1e-9,polyMaxZ-polyMinZ);
+        const polyEdges=polygon.map((a,i)=>{const b=polygon[(i+1)%polygon.length];return {a,ez:b.z-a.z,er:b.r-a.r,b,minZ:Math.min(a.z,b.z),maxZ:Math.max(a.z,b.z),minR:Math.min(a.r,b.r),maxR:Math.max(a.r,b.r)};});
+        const edgeBuckets:number[][]=Array.from({length:bucketCount},()=>[]);
+        for(let i=0;i<polyEdges.length;i++){const {a,b}=polyEdges[i],lo=Math.max(0,Math.floor((Math.min(a.z,b.z)-polyMinZ)/bucketSpan*bucketCount)),hi=Math.min(bucketCount-1,Math.floor((Math.max(a.z,b.z)-polyMinZ)/bucketSpan*bucketCount));for(let k=lo;k<=hi;k++)edgeBuckets[k].push(i);}
+        const intervalCache=new Map<number,{a:number;b:number}[]>();
+        const intervalsAt = (layerZ: number): { a: number; b: number }[] => {
+          const cached=intervalCache.get(layerZ);if(cached)return cached;
+          const hits:number[]=[],bucket=Math.max(0,Math.min(bucketCount-1,Math.floor((layerZ-polyMinZ)/bucketSpan*bucketCount)));
+          for(const i of edgeBuckets[bucket]){
+            const a=polygon[i],b=polygon[(i+1)%polygon.length];
+            if(!((a.z<=layerZ&&b.z>layerZ)||(b.z<=layerZ&&a.z>layerZ)))continue;
+            const t=(layerZ-a.z)/(b.z-a.z);
+            hits.push(a.r+(b.r-a.r)*t);
+          }
+          hits.sort((a,b)=>a-b);
+          const intervals:{a:number;b:number}[]=[];
+          for(let i=0;i+1<hits.length;i+=2){
+            const a=Math.max(0,hits[i]),b=Math.max(a,hits[i+1]);
+            if(b-a>0.05)intervals.push({a,b});
+          }
+          intervalCache.set(layerZ,intervals);
+          return intervals;
+        };
+
+        const wallZAtR = (r: number): number => {
+          if (r <= mergedWall[0].r) return mergedWall[0].z;
+          for (let i = 1; i < mergedWall.length; i++) {
+            if (r <= mergedWall[i].r) {
+              const a = mergedWall[i - 1], b = mergedWall[i];
+              const t = (r - a.r) / Math.max(1e-12, b.r - a.r);
+              return a.z + (b.z - a.z) * t;
+            }
+          }
+          return mergedWall[mergedWall.length - 1].z;
+        };
+        const maxWallZBetween = (a: number, b: number): number => {
+          const lo = Math.min(a, b), hi = Math.max(a, b);
+          let maximum = Math.max(wallZAtR(lo), wallZAtR(hi));
+          for (const point of mergedWall) {
+            if (point.r >= lo - 1e-7 && point.r <= hi + 1e-7) maximum = Math.max(maximum, point.z);
+          }
+          return maximum;
+        };
+
+        note(`INNER VERTICAL LAYERS ${layers.length} x ${f2(step)} MM`);
+        const rEntry = 0; // محور دوران؛ مسیر داخل‌تراشی باید دقیقاً به Centerline بچسبد
+        const mouthX = zOuter + p.innerStartClearance;
+        if (!bottomToInnerRoughReady && !bottomToInnerRoughDirect) enterFirstInner(2 * rEntry, mouthX);
+        const layerPlans = layers.map((layerZ) => ({ layerZ, intervals: intervalsAt(layerZ) }));
+        type AllowedPoint={r:number;z:number};
+        const allowedPoint=(r:number,z:number)=>intervalsAt(z).some(iv=>r>=iv.a-.015&&r<=iv.b+.015);
+        const rawAllowedLink=(a:AllowedPoint,b:AllowedPoint)=>{
+          /* آزمون دقیق سگمنت: به‌جای نمونه‌برداری ۲۴ تا صدها نقطه‌ای، پارامتر
+             تمام تقاطع‌های خط با مرز پیدا می‌شود و فقط وسط هر بازه بررسی می‌شود.
+             نتیجه هندسی یکسان است ولی هزینه هر آزمون تقریباً یک دور روی مرز است. */
+          const dz=b.z-a.z,dr=b.r-a.r,cuts=[0,1],cross=(az:number,ar:number,bz:number,br:number)=>az*br-ar*bz,minZ=Math.min(a.z,b.z),maxZ=Math.max(a.z,b.z),minR=Math.min(a.r,b.r),maxR=Math.max(a.r,b.r);
+          for(const edge of polyEdges){
+            if(edge.maxZ<minZ-1e-9||edge.minZ>maxZ+1e-9||edge.maxR<minR-1e-9||edge.minR>maxR+1e-9)continue;
+            const c=edge.a,ez=edge.ez,er=edge.er,den=cross(dz,dr,ez,er);
+            if(Math.abs(den)<1e-10)continue;
+            const cz=c.z-a.z,cr=c.r-a.r,t=cross(cz,cr,ez,er)/den,u=cross(cz,cr,dz,dr)/den;
+            if(t>1e-9&&t<1-1e-9&&u>=-1e-9&&u<=1+1e-9)cuts.push(t);
+          }
+          cuts.sort((x,y)=>x-y);
+          for(let i=0;i<cuts.length-1;i++){
+            if(cuts[i+1]-cuts[i]<1e-9)continue;
+            const t=(cuts[i]+cuts[i+1])/2;
+            if(!allowedPoint(a.r+dr*t,a.z+dz*t))return false;
+          }
+          return allowedPoint(a.r,a.z)&&allowedPoint(b.r,b.z);
+        };
+        const allowedLink=rawAllowedLink;
+        /* مسیریاب فقط داخل همان رنگ آبی حرکت می‌کند. در صورت نامعتبر بودن خط
+           مستقیم، A* روی شبکه داخلی اجرا و سپس قطعات اضافی با آزمون دید مستقیم
+           حذف می‌شوند؛ بنابراین تمام G0/G1های اتصال داخل چندضلعی می‌مانند. */
+        const planBaseLink=(from:AllowedPoint,to:AllowedPoint):AllowedPoint[]|null=>{
+          if(allowedLink(from,to))return [to];
+          if(p.innerBoundaryRoutingMode==="orthogonal"||p.innerBoundaryRoutingMode==="nearest"||p.innerBoundaryRoutingMode==="rawBoundary"||p.innerBoundaryRoutingMode==="rdp"){
+            /* دو میانبر قائم ممکن را پیش از مسیریابی مرزی امتحان می‌کند. هر دو
+               ضلع جداگانه با همان آزمون دقیق ناحیه آبی تأیید می‌شوند. */
+            const elbows:AllowedPoint[]=[{z:to.z,r:from.r},{z:from.z,r:to.r}];
+            for(const elbow of elbows)if(allowedLink(from,elbow)&&allowedLink(elbow,to))return [elbow,to];
+            const axisA:AllowedPoint={z:from.z,r:0},axisB:AllowedPoint={z:to.z,r:0};
+            if(allowedLink(from,axisA)&&allowedLink(axisA,axisB)&&allowedLink(axisB,to))return [axisA,axisB,to];
+          }
+          /* مسیر جایگزین روی خود مرز ناحیه آبی ساخته می‌شود. برخلاف Grid/A*،
+             تعداد گره‌ها به مساحت قطعه وابسته نیست و رابط روی طرح‌های بزرگ
+             قفل نمی‌شود. دو سر مسیر فقط به رأس‌هایی وصل می‌شوند که خط دیدشان
+             کاملاً داخل ناحیه مجاز باشد. */
+          const n=polygon.length;
+          /* برای دورزدن فرورفتگی‌ها فقط رأس‌های reflex لازم‌اند. چند رأس نزدیک
+             هر سر مسیر نیز افزوده می‌شود تا ورود/خروج از مرز همیشه کوتاه بماند.
+             در صورت پیدا نشدن دید، همه رأس‌ها به‌عنوان fallback بررسی می‌شوند. */
+          let area2=0;for(let i=0;i<n;i++)area2+=polygon[i].z*polygon[(i+1)%n].r-polygon[(i+1)%n].z*polygon[i].r;
+          const reflex:number[]=[];for(let i=0;i<n;i++){const a=polygon[(i+n-1)%n],b=polygon[i],c=polygon[(i+1)%n],az=b.z-a.z,ar=b.r-a.r,bz=c.z-b.z,br=c.r-b.r,turn=az*br-ar*bz,scale=Math.hypot(az,ar)*Math.hypot(bz,br);if(turn*area2 < -1e-8&&scale>1e-9&&Math.abs(turn)/scale>.2)reflex.push(i);}
+          const candidates=(q:AllowedPoint)=>{const set=new Set(reflex);set.add(0);set.add(1);set.add(2);set.add(3);set.add(n-1);const shortCode=p.innerBoundaryRoutingMode==="shortCode",compact=shortCode||p.innerBoundaryRoutingMode==="offsetOptimized"||p.innerBoundaryRoutingMode==="compact"||p.innerBoundaryRoutingMode==="orthogonal"||p.innerBoundaryRoutingMode==="nearest"||p.innerBoundaryRoutingMode==="rawBoundary"||p.innerBoundaryRoutingMode==="rdp";if(!shortCode){const stride=Math.max(1,Math.ceil(n/(compact?8:24)));for(let i=0;i<n;i+=stride)set.add(i);}[...Array(n).keys()].sort((i,j)=>Math.hypot(polygon[i].z-q.z,polygon[i].r-q.r)-Math.hypot(polygon[j].z-q.z,polygon[j].r-q.r)).slice(0,shortCode?2:compact?3:6).forEach(i=>set.add(i));return [...set];};
+          const visible=(q:AllowedPoint,reverse=false)=>{let out=candidates(q).filter(i=>reverse?allowedLink(polygon[i],q):allowedLink(q,polygon[i]));if(!out.length)out=[...Array(n).keys()].filter(i=>reverse?allowedLink(polygon[i],q):allowedLink(q,polygon[i]));return out;};
+          const nearestVisible=(q:AllowedPoint,reverse=false)=>{
+            let nearest=0,best=Infinity;for(let i=0;i<n;i++){const d=(polygon[i].z-q.z)**2+(polygon[i].r-q.r)**2;if(d<best){best=d;nearest=i;}}
+            for(let step=0;step<n;step++){const ids=step?[((nearest+step)%n),((nearest-step+n)%n)]:[nearest];for(const i of ids)if(reverse?allowedLink(polygon[i],q):allowedLink(q,polygon[i]))return [i];}
+            return [] as number[];
+          };
+          const nearestMode=p.innerBoundaryRoutingMode==="nearest"||p.innerBoundaryRoutingMode==="rawBoundary"||p.innerBoundaryRoutingMode==="rdp",fromVisible=nearestMode?nearestVisible(from):visible(from),toVisible=nearestMode?nearestVisible(to,true):visible(to,true);
+          if(!fromVisible.length||!toVisible.length)return null;
+          const edgeLen=polygon.map((q,i)=>Math.hypot(q.z-polygon[(i+1)%n].z,q.r-polygon[(i+1)%n].r));
+          /* فاصله تجمعی مرز، انتخاب بهترین جفت رأس را از O(n³) به O(n²)
+             کاهش می‌دهد؛ در هر حرکت ویرایشی این بخش ده‌ها بار اجرا می‌شود. */
+          const prefix=new Float64Array(n+1);for(let i=0;i<n;i++)prefix[i+1]=prefix[i]+edgeLen[i];
+          const perimeter=prefix[n],clockwise=(i:number,j:number)=>j>=i?prefix[j]-prefix[i]:perimeter-prefix[i]+prefix[j];
+          let best=Infinity,bestI=-1,bestJ=-1,forward=true;
+          for(const i of fromVisible)for(const j of toVisible){
+            const endCost=Math.hypot(from.z-polygon[i].z,from.r-polygon[i].r)+Math.hypot(to.z-polygon[j].z,to.r-polygon[j].r);
+            const cw=clockwise(i,j),ccw=perimeter-cw;
+            if(endCost+cw<best){best=endCost+cw;bestI=i;bestJ=j;forward=true;}
+            if(endCost+ccw<best){best=endCost+ccw;bestI=i;bestJ=j;forward=false;}
+          }
+          if(bestI<0)return null;
+          const raw:AllowedPoint[]=[];
+          for(let i=bestI;;i=(i+(forward?1:n-1))%n){raw.push(polygon[i]);if(i===bestJ)break;}
+          raw.push(to);
+          if(p.innerBoundaryRoutingMode==="rawBoundary")return raw;
+          if(p.innerBoundaryRoutingMode==="rdp"){
+            /* Douglas–Peucker ایمن: ابتدا انحراف هندسی را ارزان می‌سنجد و فقط
+               برای وترهای قابل حذف، آزمون دقیق محدوده آبی را اجرا می‌کند. */
+            const reduced:AllowedPoint[]=[];
+            const simplify=(lo:number,hi:number)=>{const a=raw[lo],b=raw[hi],dz=b.z-a.z,dr=b.r-a.r,len2=dz*dz+dr*dr;let far=lo,maxD=-1;for(let k=lo+1;k<hi;k++){const q=raw[k],t=len2?Math.max(0,Math.min(1,((q.z-a.z)*dz+(q.r-a.r)*dr)/len2)):0,d=(q.z-a.z-dz*t)**2+(q.r-a.r-dr*t)**2;if(d>maxD){maxD=d;far=k;}}if(maxD<=.01&&allowedLink(a,b)){reduced.push(b);return;}if(far<=lo||far>=hi){reduced.push(b);return;}simplify(lo,far);simplify(far,hi);};
+            if(raw.length){reduced.push(raw[0]);if(raw.length>1)simplify(0,raw.length-1);}return reduced;
+          }
+          /* حذف رأس‌های غیرضروری فقط با آزمون کامل داخل‌بودن خط جایگزین. */
+          const out:AllowedPoint[]=[];let anchor=from,i=0;
+          while(i<raw.length){
+            let j=raw.length-1;
+            if(p.innerBoundaryRoutingMode==="expBinary"||p.innerBoundaryRoutingMode==="compact"||p.innerBoundaryRoutingMode==="offsetOptimized"||p.innerBoundaryRoutingMode==="shortCode"||p.innerBoundaryRoutingMode==="orthogonal"||p.innerBoundaryRoutingMode==="nearest"||p.fastInnerBoundaryRouting){
+              /* حالت سریع جدید: عقب‌گرد نمایی و سپس بازیابی دورترین نقطه امن
+                 با جست‌وجوی دودویی. */
+              let step=1,failed=raw.length;
+              while(j>i&&!allowedLink(anchor,raw[j])){failed=j;j=Math.max(i,j-step);step*=2;}
+              let lo=j,hi=failed;while(hi-lo>1){const mid=(lo+hi)>>1;if(allowedLink(anchor,raw[mid]))lo=mid;else hi=mid;}j=lo;
+            }else{
+              /* حالت قبلی و پیش‌فرض، طبق انتخاب Preferences. */
+              while(j>i&&!allowedLink(anchor,raw[j]))j--;
+            }
+            out.push(raw[j]);anchor=raw[j];i=j+1;
+          }
+          return out;
+        };
+        /* همه الگوریتم‌ها ابتدا فاصله ۳mm را برای هسته G0 می‌خواهند. فقط ساق
+           کوتاه خروج/ورود پاس مستثناست؛ در تنگنا فاصله نیم‌میلی‌متری تا صفر کم می‌شود. */
+        const planAllowedLink=(from:AllowedPoint,to:AllowedPoint):AllowedPoint[]|null=>{
+          const base=planBaseLink(from,to);if(!base)return null;
+          const original=[from,...base],lengths=original.slice(1).map((q,i)=>Math.hypot(q.z-original[i].z,q.r-original[i].r)),total=lengths.reduce((s,v)=>s+v,0),dense:{q:AllowedPoint;along:number}[]=[{q:from,along:0}];let passed=0;
+          for(let k=0;k<lengths.length;k++){const a=original[k],b=original[k+1],n=Math.max(1,Math.ceil(lengths[k]/(p.innerBoundaryRoutingMode==="offsetOptimized"?3:1.5)));for(let i=1;i<=n;i++){const t=i/n;dense.push({q:{z:a.z+(b.z-a.z)*t,r:a.r+(b.r-a.r)*t},along:passed+lengths[k]*t});}passed+=lengths[k];}
+          const out:AllowedPoint[]=[],previousNormals:{z:number;r:number}[]=[];let previous=from;
+          /* آفست واقعی در راستای نرمال محلی مسیر ساخته می‌شود؛ بنابراین بالا،
+             پایین و دو سوی قوس همگی فاصله می‌گیرند. سمت نرمالی انتخاب می‌شود
+             که داخل محدوده آبی بماند و مقدار هر نقطه مستقل تا صفر کاهش می‌یابد. */
+          for(let i=1;i<dense.length;i++){
+            const q=dense[i].q,before=dense[Math.max(0,i-1)].q,after=dense[Math.min(dense.length-1,i+1)].q,tz=after.z-before.z,tr=after.r-before.r,len=Math.hypot(tz,tr)||1,n0={z:-tr/len,r:tz/len},last=previousNormals[previousNormals.length-1],normals=last&&last.z*n0.z+last.r*n0.r<0?[{z:-n0.z,r:-n0.r},n0]:[n0,{z:-n0.z,r:-n0.r}];
+            const ramp=Math.min(3,dense[i].along,total-dense[i].along);let chosen:AllowedPoint|null=null,chosenNormal:AllowedPoint|null=null;
+            for(let shift=Math.floor((ramp+1e-9)*2)/2;shift>=0&&!chosen;shift-=.5)for(const normal of normals){const candidate={z:q.z+normal.z*shift,r:q.r+normal.r*shift};if(candidate.r>=-.001&&allowedPoint(candidate.r,candidate.z)&&allowedLink(previous,candidate)){chosen=candidate;chosenNormal=normal;break;}}
+            if(!chosen){const bridge=planBaseLink(previous,q);if(bridge)out.push(...bridge);else out.push(q);previous=q;continue;}
+            if(chosenNormal)previousNormals.push(chosenNormal);out.push(chosen);previous=chosen;
+          }
+          /* حالت ویژه کم‌خط: از هر رأس، دورترین وتر دقیق و مجاز را انتخاب می‌کند.
+             خطای عمودی حداکثر ۰٫۲۵mm است و آزمون محدوده فقط برای وترهای هندسی
+             قابل‌قبول اجرا می‌شود؛ در نتیجه هم کم‌خط و هم برای Preview سریع است. */
+          if(p.innerBoundaryRoutingMode==="offsetOptimized"&&out.length>2){const reduced:AllowedPoint[]=[out[0]];let i=0;while(i<out.length-1){let chosen=i+1;for(let j=out.length-1;j>i+1;j--){const a=out[i],b=out[j],dz=b.z-a.z,dr=b.r-a.r,len2=dz*dz+dr*dr;let valid=true;for(let k=i+1;k<j;k++){const q=out[k],t=len2?Math.max(0,Math.min(1,((q.z-a.z)*dz+(q.r-a.r)*dr)/len2)):0;if((q.z-a.z-dz*t)**2+(q.r-a.r-dr*t)**2>.0625){valid=false;break;}}if(valid&&allowedLink(a,b)){chosen=j;break;}}reduced.push(out[chosen]);i=chosen;}return reduced;}
+          /* RDP ایمن نقاط نمونه‌برداری را کم می‌کند، بدون آنکه وتر جایگزین از
+             محدوده آبی خارج شود یا فرم آفست قوس از بین برود. */
+          if(out.length<=2)return out;const compact:AllowedPoint[]=[out[0]],simplify=(lo:number,hi:number)=>{const a=out[lo],b=out[hi],dz=b.z-a.z,dr=b.r-a.r,len2=dz*dz+dr*dr;let far=lo,maxD=-1;for(let k=lo+1;k<hi;k++){const q=out[k],t=len2?Math.max(0,Math.min(1,((q.z-a.z)*dz+(q.r-a.r)*dr)/len2)):0,d=(q.z-a.z-dz*t)**2+(q.r-a.r-dr*t)**2;if(d>maxD){maxD=d;far=k;}}if(maxD<=.04&&allowedLink(a,b)){compact.push(b);return;}if(far<=lo||far>=hi){compact.push(b);return;}simplify(lo,far);simplify(far,hi);};simplify(0,out.length-1);return compact;
+        };
+
+        /* روش‌های دوطرفهٔ داخل: همان منطق Active Region خشن بیرونی، با
+           ترانهادهٔ X/R. هر پاس به‌جای یک خط تخت، C(R)=max(دیواره+کلیرنس،
+           لایه) را دنبال می‌کند؛ بنابراین قله، دره و خطوط زیگزاگی بدون ورود
+           به خط آفست حفظ می‌شوند. */
+        if (p.innerRoughMode !== "classic") {
+          type InnerCut = { layerZ:number; a:number; b:number; group:number; forward:boolean; pass:number };
+          const cuts: InnerCut[] = [];
+          /* جهت در سطح «پاس» تعیین می‌شود، نه برای هر بازه. اگر یک لایه به‌علت
+             چند قله به چند Active Region شکسته شود، ابزار همه آن‌ها را در همان
+             جهت Y طی می‌کند و تا آخرین دره جهت را معکوس نمی‌کند. */
+          const firstDirectionByGroup=new Map<number,boolean>();
+          const appendPass=(plan:{layerZ:number;intervals:{a:number;b:number}[]},group:number,pass:number,lo:number,hi:number)=>{
+            const clipped=plan.intervals.map(iv=>({a:Math.max(iv.a,lo),b:Math.min(iv.b,hi)})).filter(iv=>iv.b-iv.a>0.05);
+            if(!clipped.length)return;
+            if(!firstDirectionByGroup.has(group)){
+              /* جهت هر عملیات مستقل است. موقعیت انتهایی کف‌تراشی نباید جهت
+                 اولین پاس خشن داخل را عوض کند؛ فقط دکمه همان inner-rough مجاز
+                 به معکوس‌کردن شروع از محور/بیرون است. */
+              firstDirectionByGroup.set(group,!op.reverse);
+            }
+            const baseForward=firstDirectionByGroup.get(group)!;
+            const forward=pass%2===0?baseForward:!baseForward;
+            const ordered=forward?clipped:[...clipped].reverse();
+            for(const iv of ordered)cuts.push({layerZ:plan.layerZ,a:iv.a,b:iv.b,group,forward,pass});
+          };
+          if (p.innerRoughMode === "zone") {
+            const maxR=Math.max(...mergedWall.map(q=>q.r));
+            const bs=p.innerZoneBounds.filter(v=>v>0.05&&v<maxR-0.05).sort((a,b)=>a-b);
+            const edges=[0,...bs,maxR];
+            const zones=edges.slice(0,-1).map((a,i)=>({a,b:edges[i+1]}));
+            const validOrder=p.innerZoneOrder.length===zones.length&&new Set(p.innerZoneOrder).size===zones.length&&p.innerZoneOrder.every(i=>i>=0&&i<zones.length);
+            const ord=validOrder?p.innerZoneOrder:zones.map((_,i)=>i);
+            for(const zi of ord)layerPlans.forEach((plan,pass)=>appendPass(plan,zi,pass,zones[zi].a,zones[zi].b));
+          } else {
+            const maxR=Math.max(...mergedWall.map(q=>q.r));
+            layerPlans.forEach((plan,pass)=>appendPass(plan,0,pass,0,maxR));
+          }
+
+          const simplifyInnerContour=(pts:{r:number;z:number}[])=>{
+            if(pts.length<=2)return pts;
+            const keep=new Uint8Array(pts.length);keep[0]=keep[pts.length-1]=1;
+            const stack:[number,number][]=[[0,pts.length-1]];
+            while(stack.length){
+              const [a,b]=stack.pop()!,A=pts[a],B=pts[b],dr=B.r-A.r,dz=B.z-A.z,den=dr*dr+dz*dz;
+              let far=0,at=-1;
+              for(let i=a+1;i<b;i++){
+                const t=den>1e-18?Math.max(0,Math.min(1,((pts[i].r-A.r)*dr+(pts[i].z-A.z)*dz)/den)):0;
+                const d=Math.hypot(pts[i].r-(A.r+t*dr),pts[i].z-(A.z+t*dz));
+                if(d>far){far=d;at=i;}
+              }
+              if(at>=0&&far>0.02){keep[at]=1;stack.push([a,at],[at,b]);}
+            }
+            return pts.filter((_,i)=>keep[i]);
+          };
+          const contours=cuts.map(cut=>{
+            const a=Math.max(0,cut.a),b=Math.max(a,cut.b);
+            /* خود Scanline تضمین می‌کند این بازه در محدوده مجاز است؛ پاس باید
+               در X ثابت از یک سر بازه تا سر دیگر باقی بماند تا زیگزاگ کامل شود. */
+            const radial=[{r:a,z:cut.layerZ},{r:b,z:cut.layerZ}];
+            const ordered=cut.forward?radial:[...radial].reverse();
+            return {group:cut.group,pass:cut.pass,a,b,points:simplifyInnerContour(ordered)};
+          }).filter(c=>c.points.length>=2);
+
+          /* ایمنی اتصال مورب با خود Scanline سنجیده می‌شود، نه envelope شعاعی؛
+             بنابراین قله‌ها و دره‌های هم‌زمان X/Y نیز درست دیده می‌شوند. */
+          const scanlineLinkIsSafe=allowedLink;
+          /* اگر پاس +Y در لبه قوس تمام شود و اتصال مستقیم −X به پاس بعدی خط
+             آفست را قطع کند، فقط انتهای همین پاس عقب آورده می‌شود. نزدیک‌ترین
+             نقطه امن با جست‌وجوی درشت و سپس دودویی پیدا می‌شود؛ در نتیجه اتصال
+             همچنان یک خط مستقیم است و هیچ حرکت واسطی به زیگزاگ افزوده نمی‌شود. */
+          for(let i=0;i+1<contours.length;i++){
+            const current=contours[i],next=contours[i+1];
+            if(current.group!==next.group||current.pass===next.pass)continue;
+            const first=current.points[0],lastIndex=current.points.length-1;
+            const end=current.points[lastIndex],nextStart=next.points[0];
+            if(end.r<=first.r+1e-7||nextStart.z>=end.z-1e-7||scanlineLinkIsSafe(end,nextStart))continue;
+            let safeR:number|null=null,unsafeR=end.r;
+            const span=end.r-first.r;
+            for(let k=1;k<=80;k++){
+              const candidateR=end.r-span*k/80;
+              if(scanlineLinkIsSafe({r:candidateR,z:end.z},nextStart)){
+                safeR=candidateR;
+                break;
+              }
+              unsafeR=candidateR;
+            }
+            if(safeR==null)continue;
+            let safe:number=safeR;
+            for(let k=0;k<28;k++){
+              const mid:number=(safe+unsafeR)/2;
+              if(scanlineLinkIsSafe({r:mid,z:end.z},nextStart))safe=mid;
+              else unsafeR=mid;
+            }
+            current.points[lastIndex]={r:safe,z:end.z};
+          }
+
+          let alreadyAtNextStart=false;
+          for(let i=0;i<contours.length;i++){
+            const contour=contours[i],start=contour.points[0],end=contour.points[contour.points.length-1];
+            if(!alreadyAtNextStart){
+              if(bottomToInnerRoughDirect){
+                mv(1,2*start.r,start.z,p.feedRough*.7,"bore");
+                bottomToInnerRoughDirect=false;
+              }else if(bottomToInnerRoughReady){
+                /* مرحله دوم فقط Y تا نزدیک‌ترین سر پاس؛ مرحله سوم فقط −X. */
+                rawRapid(2*start.r,cur.z);
+                mv(1,2*start.r,start.z,p.feedRough*0.7,"bore");
+                bottomToInnerRoughReady=false;
+              }else{
+                const safeZ=Math.max(mouthX,maxWallZBetween(0,start.r)+p.safety);
+                if(cur.z<safeZ-1e-7)rawRapid(cur.x,safeZ);
+                rawRapid(2*start.r,safeZ);
+                mv(1,2*start.r,start.z,p.feedRough*0.7,"bore");
+              }
+            }
+            for(let k=1;k<contour.points.length;k++){
+              const q=contour.points[k];
+              mv(1,2*q.r,q.z,p.feedRough,"bore");
+            }
+
+            const next=contours[i+1];
+            alreadyAtNextStart=false;
+            if(next){
+              const ns=next.points[0];
+              const sameZone=next.group===contour.group;
+              /* پاس‌های متوالی از همان سر زیگزاگ به هم می‌رسند: اتصال +X روی
+                 سر نزدیک محور (Y منفیِ امن نسبت به نوک کاسه) و اتصال −X روی سر
+                 قوس انجام می‌شود. بنابراین برای پاس مجاور خط واسط ساخته نمی‌شود. */
+              if(sameZone&&scanlineLinkIsSafe(end,ns)){
+                mv(1,2*ns.r,ns.z,p.feedRough,"bore");
+              }else{
+                const plan=planAllowedLink(end,ns);
+                if(plan){for(let k=0;k<plan.length-1;k++)rawRapid(2*plan[k].r,plan[k].z);const q=plan[plan.length-1];mv(1,2*q.r,q.z,p.feedRough*.7,"bore");}
+                else { /* فقط در هندسه نامعتبر؛ از تولید خط خارج محدوده خودداری می‌شود. */ mv(1,2*ns.r,ns.z,p.feedRough*.7,"bore"); }
+              }
+              alreadyAtNextStart=true;
+            }
+          }
+          innerCleared=true;
+          if(!finishLastInner(op.id)){
+            if(nextIsInnerPath(op.id)) moveInnerToAxisSafely();
+            else { moveInnerToAxisSafely(); rawRapid(0,mouthX); mv(0,retractX,mouthX,0,"rapid"); }
+          }
+          break;
+        }
+        const planClassicRapid=(from:AllowedPoint,to:AllowedPoint,minZ:number):AllowedPoint[]|null=>{
+          if(to.z>=from.z-1e-7&&allowedLink(from,to))return [to];
+          const planned=planAllowedLink(from,to);let previousZ=from.z;
+          if(planned&&planned.every(q=>{const monotonic=q.z>=previousZ-1e-7;previousZ=q.z;return monotonic;}))return planned;
+          const firstRetreat=Math.max(1,Math.ceil(Math.max(0,to.z-minZ)));
+          for(let retreat=firstRetreat;minZ+retreat<=mouthPlaneZ+1e-7;retreat+=1){
+            const z=Math.min(mouthPlaneZ,minZ+retreat),a={r:from.r,z},b={r:to.r,z};
+            /* نقطه پایان G0 می‌تواند جلوتر از ۱mm باشد؛ ورود از آن نقطه تا عمق
+               واقعی پاس بعد فقط در حلقه بعد و با G1 انجام می‌شود. */
+            if(allowedLink(from,b))return [b];
+            if(allowedLink(from,a)&&allowedLink(a,b))return [a,b];
+          }
+          return null;
+        };
+        let preparedForNextLayer = false;
+        for (let layerIndex = 0; layerIndex < layerPlans.length; layerIndex++) {
+          const { layerZ, intervals: layerIntervals } = layerPlans[layerIndex];
+          for (let intervalIndex = 0; intervalIndex < layerIntervals.length; intervalIndex++) {
+            const interval = layerIntervals[intervalIndex];
+            const lowR = Math.max(rEntry, interval.a);
+            const highR = Math.max(lowR, interval.b);
+            const startR = op.reverse ? highR : lowR;
+            const endR = op.reverse ? lowR : highR;
+            /* تضمین نهایی مستقل از تشخیص بازه: کل خط برش عمودی باید در سمت
+               حفرهٔ آفست بماند، پس X پاس از راست‌ترین نقطه آفست در همان بازه
+               کمتر نمی‌شود. */
+            const cutZ = layerZ; // بازه Scanline در همین X کاملاً داخل محدوده مجاز است
+            const nextInterval = layerIntervals[intervalIndex + 1];
+
+            /* فقط ناحیهٔ اول هر لایه از محور و دهانه شروع می‌شود. بعد از هر قله،
+               ابزار در همان شعاع جلوتر قرار گرفته و مستقیماً در −X وارد می‌شود. */
+            if (intervalIndex === 0) {
+              if (!preparedForNextLayer && layerIndex === 0) {
+                /* فقط نخستین لایه از صفحه ورود دهانه آغاز می‌شود. در لایه‌های
+                   بعدی اگر ابزار به محور برگشته باشد، همان‌جا در X امن قرار دارد
+                   و باید مستقیم در −X وارد پاس بعدی شود؛ بازگشت دوباره به mouthX
+                   یک حرکت +X کاملاً اضافی می‌ساخت. */
+                if (bottomToInnerRoughDirect) {
+                  /* G1 بعدی خودش اتصال مستقیم و تنها خط میان دو عملیات است. */
+                  bottomToInnerRoughDirect = false;
+                } else if (bottomToInnerRoughReady) {
+                  rawRapid(2 * startR, cur.z); // فقط Y
+                  bottomToInnerRoughReady = false;
+                } else rawRapid(2 * startR, mouthX);
+              }
+              preparedForNextLayer = false;
+            }
+            mv(1, 2 * startR, cutZ, p.feedRough * 0.7, "bore");
+            if (Math.abs(endR-startR) > 0.05) mv(1, 2 * endR, cutZ, p.feedRough, "bore");
+
+            if (nextInterval) {
+              const nextStartR = op.reverse ? Math.max(nextInterval.a,nextInterval.b) : Math.max(endR, nextInterval.a);
+              /* اگر در ادامهٔ +Y باربرداری دیگری وجود دارد، بازگشت به محور ممنوع
+                 است: ابتدا پشت راست‌ترین نقطهٔ قله ۰٫۵mm در +X فاصله می‌گیریم،
+                 سپس در +Y از روی قله عبور می‌کنیم و از همان‌جا در −X وارد می‌شویم. */
+              /* دو بازه هم‌عمق ممکن است در دو سوی U باشند؛ مسیر امن ناچار دور
+                 نوک منحنی می‌چرخد و می‌تواند پس از +X دوباره −X شود. این حرکت
+                 با G0 و کاملاً داخل محدوده آبی است، نه اتصال برشی مستقیم. */
+              const from={r:endR,z:cutZ},to={r:nextStartR,z:cutZ};
+              /* حالت یک‌طرفه نیز باید از همان مسیریاب آفست موضعی ۳mm عبور کند؛
+                 میانبر قدیمی planSameDepthCompact آفست را کاملاً دور می‌زد. */
+              const plan=planAllowedLink(from,to);
+              if(plan)for(const q of plan)rawRapid(2*q.r,q.z);
+              /* حلقه در تکرار بعد از همین نقطه با حرکت −X باربرداری را ادامه می‌دهد. */
+            } else {
+              const nextLayerFirst = layerPlans[layerIndex + 1]?.intervals[0];
+              if (nextLayerFirst) {
+                /* بین دو عمق هرگز G0 در −X اجرا نمی‌شود. ابزار ابتدا دقیقاً ۱mm
+                   در +X عقب می‌آید (هم‌زمان می‌تواند به شعاع شروع بعدی برود)،
+                   سپس ورود −X به عمق بعد فقط با G1 حلقه بعد انجام می‌شود. این
+                   قاعده برای جهت عادی و معکوس یکسان است. */
+                const nextLayerStartR=op.reverse?Math.max(nextLayerFirst.a,nextLayerFirst.b):Math.max(rEntry,nextLayerFirst.a);
+                const stageZ=Math.min(mouthPlaneZ,cutZ+1);
+                const plan=planClassicRapid({r:endR,z:cutZ},{r:nextLayerStartR,z:stageZ},cutZ);
+                if(plan)for(const q of plan)rawRapid(2*q.r,q.z);
+                preparedForNextLayer=!!plan;
+              } else {
+                /* پس از آخرین پاس، برگشت روی همان X تا محور مجاز است. */
+                const plan=planClassicRapid({r:endR,z:cutZ},{r:0,z:cutZ},cutZ);
+                if(plan)for(const q of plan)rawRapid(2*q.r,q.z);
+              }
+            }
+          }
+        }
+        innerCleared = true;
+        /* اگر این آخرین عملیات داخل است، بدون هیچ حرکت واسط مستقیماً +X می‌رود. */
+        if (!finishLastInner(op.id)) {
+          moveInnerToAxisSafely();
+          if (!nextIsInnerPath(op.id)) {
+            rawRapid(2 * rEntry, mouthX);
+            mv(0, retractX, mouthX, 0, "rapid");
+          }
+        }
+        break;
+      }
+      /* آفست داخل‌تراشی — پاس خط‌چینِ موازی دیواره، بین خشن و پرداخت داخل */
+      case "inner-offset": {
+        curOp = "inner-offset";
+        if (!hasInner || IOD <= 0.01) break;
+        note(`INNER OFFSET PASS ${f2(IOD)} MM (HOLDER ${op.holder})`);
+        const innerOffBase =
+          op.toolComp?.enabled && op.toolComp.mode !== "G40"
+            ? compensateInnerPolyline(innerFinishOffSamples, op.toolComp)
+            : innerFinishOffSamples;
+        if (innerOffBase.length < 2) break;
+        const zBot = innerOffBase[0].z;
+        const zRimF = innerOffBase[innerOffBase.length - 1].z;
+        const compactInnerOff = compactExactlyCollinear(innerOffBase);
+        const innerOff=op.reverse?[...compactInnerOff].reverse():compactInnerOff;
+        const startInnerZ=innerOff[0].z;
+        const rEntry = 0; // محور دوران؛ مسیر داخل‌تراشی باید دقیقاً به Centerline بچسبد
+        const mouthX = zRimF + p.innerStartClearance;
+        if (!innerCleared || curHolder !== 2) enterFirstInner(2 * rEntry, mouthX);
+        if (op.reverse && !innerFinishDirectReady) {
+          /* شروع معکوس از دهانه است: ابتدا در محور تا بیرون دهانه برو، سپس
+             در +Y روی صفحهٔ باز دهانه و فقط با G1 در −X به نوک مسیر برس؛
+             ورود شعاعی از داخل دیواره ممنوع است. */
+          if (innerCleared) moveInnerToAxisSafely();
+          rawRapid(0, mouthX);
+          mv(1, 2 * innerOff[0].r, mouthX, p.feedFinish, "boreoff");
+          mv(1, 2 * innerOff[0].r, innerOff[0].z, p.feedFinish, "boreoff");
+          } else if (innerCleared || nextEnabledOp(op.id)?.type === "inner-finish") {
+            /* از پایان خشن، یا هنگام حذف خشن و اتصال مستقیم به پرداخت، با کوتاه‌ترین
+               مسیر امن از قله‌ها به محور می‌رسیم؛ سپس روی محور تا کف می‌رویم. */
+          moveInnerToAxisSafely();
+          rawRapid(0, startInnerZ);
+          mv(1, 2 * innerOff[0].r, innerOff[0].z, p.feedRough * 0.6, "bore");
+        } else {
+          mv(1, 2 * rEntry, startInnerZ, p.feedRough * 0.6, "bore");
+          mv(1, 2 * innerOff[0].r, innerOff[0].z, p.feedRough * 0.6, "bore");
+        }
+        /* خط بنفش فقط خود مسیر آفست دقیق است. */
+        emitFinishingPath(innerOff,innerOffBase,"boreoff",p.feedFinish,true,!!op.reverse);
+        if (!finishLastInner(op.id)) {
+          const next = nextEnabledOp(op.id);
+          innerOffsetToFinishReady = next?.type === "inner-finish";
+          /* اگر جهت دو عملیات مخالف باشد، پایان آفست دقیقاً کنار شروع پرداخت
+             قرار می‌گیرد: اتصال باید یک G1 با رنگ و فید پرداخت داخل باشد.
+             در این حالت هیچ G0 واسطی تولید نمی‌کنیم. */
+          const directToInnerFinish = next?.type === "inner-finish" && op.reverse !== !!next.reverse;
+          if (directToInnerFinish) {
+            const nextFinishBase =
+              next?.toolComp?.enabled && next.toolComp.mode !== "G40"
+                ? compensateInnerPolyline(innerFinishPath, next.toolComp)
+                : innerFinishPath;
+            const target = next.reverse
+              ? nextFinishBase[nextFinishBase.length - 1]
+              : nextFinishBase[0];
+            mv(1, 2 * target.r, target.z, p.feedFinish, "borefin");
+            innerFinishDirectReady = true;
+          } else if (innerCleared) {
+            moveInnerToAxisSafely();
+            if (!nextIsInnerPath(op.id)) rawRapid(2 * rEntry, mouthX);
+          } else {
+            /* برگشت روی مسیر تراش‌خورده سریع است و جزء هندسهٔ بنفش آفست نیست. */
+            for (let i = innerOff.length - 2; i >= 0; i--) {
+              rawRapid(2 * innerOff[i].r, innerOff[i].z);
+            }
+            rawRapid(2 * rEntry, zBot);
+            rawRapid(2 * rEntry, mouthX);
+          }
+          if (!directToInnerFinish && !nextIsInnerPath(op.id)) mv(0, retractX, mouthX, 0, "rapid");
+        }
+        break;
+      }
+      /* پرداخت داخل — دنبال‌کردن دیواره داخلی از کف تا دهانه با هلدر دوم */
+      case "inner-finish": {
+        curOp = "inner-finish";
+        if (!hasInner) break;
+        note(`INNER FINISH - BOWL WALL (HOLDER ${op.holder})`);
+        const IWBase =
+          op.toolComp?.enabled && op.toolComp.mode !== "G40"
+            ? compensateInnerPolyline(innerFinishPath, op.toolComp)
+            : innerFinishPath;
+        const zBot = IWBase[0].z;
+        const zRimF = IWBase[IWBase.length - 1].z;
+        const compactIW = compactExactlyCollinear(IWBase);
+        const IW=op.reverse?[...compactIW].reverse():compactIW;
+        const startInnerZ=IW[0].z;
+        const rEntry = 0; // محور دوران؛ مسیر داخل‌تراشی باید دقیقاً به Centerline بچسبد
+        /* ورود از صفحه امن، به‌اندازه فاصله تنظیم‌شده جلوتر از شروع مسیر داخل‌تراشی */
+        const mouthX = zRimF + p.innerStartClearance;
+        const directFromOffset = innerFinishDirectReady;
+        const fromOffsetConnection = innerOffsetToFinishReady;
+        innerFinishDirectReady = false;
+        innerOffsetToFinishReady = false;
+        if (!directFromOffset && !fromOffsetConnection && (!innerCleared || curHolder !== 2)) enterFirstInner(2 * rEntry, mouthX);
+        if (!directFromOffset && op.reverse) {
+          /* در شروع Reverse نیز از دهانهٔ باز وارد می‌شویم، نه با خط شعاعی
+             از داخل حفره تا دیواره؛ اتصال آخر خشن داخل/کف‌تراشی امن می‌ماند. */
+          if (innerCleared) moveInnerToAxisSafely();
+          rawRapid(2 * rEntry, mouthX);
+          mv(1, 2 * IW[0].r, mouthX, p.feedFinish, "borefin");
+          mv(1, 2 * IW[0].r, IW[0].z, p.feedFinish, "borefin");
+        } else if (!directFromOffset) {
+          if (innerCleared) {
+            /* مانند آفست: ابتدا از نزدیک‌ترین مسیر امن به محور، سپس روی محور تا کف. */
+            moveInnerToAxisSafely();
+            rawRapid(2 * rEntry, startInnerZ);
+          } else mv(1, 2 * rEntry, startInnerZ, p.feedRough * 0.6, "borefin"); // بدون خشن‌کاری: ورود با فیدر
+        }
+        emitFinishingPath(IW,IWBase,"borefin",p.feedFinish,true,!!op.reverse);
+        if (!finishLastInner(op.id)) {
+          if (innerCleared) {
+            /* خروج سریع از حفره خالی: شعاعی به مرکز، سپس محوری به بیرون خط داخلی */
+            rawRapid(2 * rEntry, zRimF);
+            rawRapid(2 * rEntry, mouthX);
+          } else {
+            /* بدون خشن‌کاری حفره پر است: بازگشت با فیدر در شیار برش تا کف، سپس خروج */
+            for (let i = IW.length - 2; i >= 0; i--) mv(1, 2 * IW[i].r, IW[i].z, p.feedFinish, "borefin");
+            mv(1, 2 * rEntry, zBot, p.feedFinish, "borefin");
+            mv(1, 2 * rEntry, mouthX, p.feedRough * 0.6, "borefin");
+          }
+          mv(0, retractX, mouthX, 0, "rapid");
+        }
+        break;
+      }
+      /* پرداخت نهایی روی خط اصلی طرح */
+      case "finish": {
+        curOp = "finish";
+        if (!hasOuter) break;
+        note("FINISHING - MAIN PROFILE");
+        const compFinishDense =
+          op.toolComp?.enabled && op.toolComp.mode !== "G40"
+            ? compensateOuterPolyline(outerFinishPath, op.toolComp, false)
+            : outerFinishPath;
+        const compFinishCompact = compactExactlyCollinear(compFinishDense);
+        const finishOrderedPath = op.reverse ? [...compFinishCompact].reverse() : compFinishCompact;
+        /* ورود کوتاه: سریع تا بالای نقطه شروع (جلوتر از صفحه پیشانی، بیرون از
+           خط آفست با فاصله امن کامل)، سپس فرورفتن مورب کوتاه با فیدر.
+           با گسترش G0 صفحه ورود ۳mm جلوتر است تا روی ورود آفست نیفتد. */
+        if (finishOrderedPath.length) {
+          const nextAxial = finishOrderedPath.slice(1).find(point => Math.abs(point.z - finishOrderedPath[0].z) > 1e-7);
+          const leadDir: 1 | -1 = nextAxial ? (nextAxial.z > finishOrderedPath[0].z ? 1 : -1) : (op.reverse ? -1 : 1);
+          enterOuterPath(finishOrderedPath[0].r, finishOrderedPath[0].z, p.feedFinish, "finish", leadDir);
+        }
+        emitFinishingPath(finishOrderedPath, compFinishDense, "finish", p.feedFinish, true, !!op.reverse);
+        /* این خروج باید بعد از هر پرداخت نهایی اجرا شود، حتی اگر عملیات فعال
+           دیگری بعد از آن باشد؛ محدودکردن آن به آخرین عملیات باعث می‌شد در
+           پروژه‌های داخل+خارج هیچ تغییری دیده نشود. عادی: +X، Reverse: −X. */
+        rawRapid(cur.x,cur.z+(op.reverse?-1.5:1.5));
+        break;
+      }
+      /* آفست — خط موازی با طرح؛ مرجع مراحل خشن و نیمه‌پرداخت قبل از پرداخت */
+      case "offset": {
+        curOp = "offset";
+        if (!hasOuter) break;
+        if (OD > 0.01 || (op.toolComp?.enabled && op.toolComp.mode !== "G40")) {
+          note(`OFFSET PASS +${f2(OD)} MM (PARALLEL TO PROFILE)`);
+          /* ورود کوتاه: سریع تا بالای نقطه شروع (جلوتر از صفحه پیشانی)، سپس
+             فرورفتن مورب کوتاه با فیدر — بدون فیدر طولانی روی صفحه تراش‌خورده */
+          const compOffDense =
+            op.toolComp?.enabled && op.toolComp.mode !== "G40"
+              ? compensateOuterPolyline(offSamples, op.toolComp, false)
+              : offSamples;
+          const compactOffsetPath = compactExactlyCollinear(compOffDense);
+          const offsetPath=op.reverse?[...compactOffsetPath].reverse():compactOffsetPath;
+          enterOuterPath(offsetPath[0].r,offsetPath[0].z,p.feedFinish,"offset");
+          emitFinishingPath(offsetPath,compOffDense,"offset",p.feedFinish,false,!!op.reverse);
+          if(!nextIsOuterPath(op.id)) mv(0,2*(offsetPath[offsetPath.length-1].r+p.safety),offsetPath[offsetPath.length-1].z,0,"rapid");
+        }
+        break;
+      }
+    }
+  }
+
+  /* پایان: پس از پایان مستقیم عملیات داخلی، هیچ جابه‌جایی دیگری مجاز نیست. */
+  curOp = "sys";
+  curOpId = -1;
+  if (!endedAtInnerEndpoint) {
+    curHolder = 1;
+    note("END OF PROGRAM");
+    /* پایان فقط در همان سمت عملیات تا ارتفاع امن جمع می‌شود؛ بازگشت Home حذف شد. */
+    mv(0, retractX, cur.z, 0, "rapid");
+  }
+  /* نقطه E فقط در طرح‌های بدون Split با یک G0 مستقل، دقیقاً ۱mm در +Y بعد از
+     G0 پایان فعلی قرار می‌گیرد. در کاسه/طرح دارای Split پایان مسیر داخلی باید
+     دست‌نخورده بماند و این حرکت افزوده نمی‌شود. */
+  if (!p.split.enabled) rawRapid(cur.x + 2, cur.z);
+
+  /* شروع برنامه فقط یک G0 دارد: آیکن S دقیقاً ۱mm در +Y از مبدأ واقعی نخستین
+     خط G1 قرار می‌گیرد و G0 از S تا همان مبدأ رسم می‌شود. چون x داخلی قطری است،
+     یک میلی‌متر Y برابر دو میلی‌متر x است. برخلاف سگمنت صفرطول قبلی، این G0
+     هندسهٔ واقعی دارد و خط‌چین اتصال آن روی بوم دیده می‌شود. */
+  {
+    const firstCutIndex=segs.findIndex(segment=>segment.motion===1);
+    if(firstCutIndex>=0){
+      const firstCut=segs[firstCutIndex];
+      const operationStartX=firstCut.x1,operationStartZ=firstCut.z1;
+      const startX=operationStartX+2;
+      const leadingNotes=segs.slice(0,firstCutIndex).flatMap(segment=>segment.note??[]);
+      const initial:Seg={motion:0,x1:startX,z1:operationStartZ,x2:operationStartX,z2:operationStartZ,feed:RAPID_RATE,line:-1,kind:"rapid",op:firstCut.op,opId:firstCut.opId,holder:firstCut.holder,note:leadingNotes.length?leadingNotes:undefined};
+      segs.splice(0,firstCutIndex,initial);
+    }
+  }
+
+  /* گسترش G0 در جی‌کد (همه‌جهته): حرکت‌های سریعِ طولیِ روی‌هم با گام ۳mm فقط
+     به سمت بیرون (+قطر، ‎(k+1)*3‎، سقف ۳۳) باز می‌شوند تا در سیمکو هیچ دو خط
+     G0 روی هم نیفتد؛ H1 همه، H2 فقط بیرون قطعه (در/بالای رترکت پست‌شده).
+     فقط گروه‌های چندعضوی باز می‌شوند (تک‌خط‌ها سر جای واقعی می‌مانند).
+     فیدرها، حرکات شعاعی/مورب، پله‌های پل و حرکات داخل حفره دست‌نخورده‌اند. */
+  if (p.spreadG0) {
+    const sx = p.gcodeShiftX ?? 0;
+    const sy = p.gcodeShiftY ?? 0;
+    const groups = new Map<string, number[]>();
+    segs.forEach((s, i) => {
+      if (s.motion !== 0) return;
+      const a = machineUV(s.z1, s.x1, s.holder, p);
+      const b = machineUV(s.z2, s.x2, s.holder, p);
+      if (Math.hypot(b.u - a.u, b.v - a.v) < 1e-9) return; // صفر
+      if (Math.abs(b.u - a.u) < 1e-9) return; // شعاعی/مورب: نه
+      if (Math.abs(b.v - a.v) >= 1e-9) return; // فقط طولیِ محوری
+      if (s.holder === 2 && a.v < retractX - p.holder2.yOff + sy - 1e-9) return; // حفره: نه
+      const key = b.v.toFixed(2);
+      const arr = groups.get(key);
+      if (arr) arr.push(i);
+      else groups.set(key, [i]);
+    });
+    for (const arr of groups.values()) {
+      if (arr.length < 2) {
+        /* تک‌خط: ۳ واحد بیرون‌تر تا پله‌های ورود/خروج آن مورب شوند و روی هم
+           نیفتند؛ کریدور دهانه حفره (تنها گذر امن) دست‌نخورده می‌ماند */
+        if (arr.length === 1) {
+          const sg = segs[arr[0]];
+          const pa = machineUV(sg.z1, sg.x1, sg.holder, p);
+          /* کریدور ورود عملیات داخل اکنون روی قطر صفر است؛ مقدار قدیمی 1.2
+             باعث می‌شد حرکتِ واقعی محور، اشتباهاً از مسیر امن کنار گذاشته شود. */
+          const funnelV = 0 - (sg.holder === 2 ? p.holder2.yOff : 0) + sy;
+          if (Math.abs(pa.v - funnelV) >= 1.0) sg.fan = 3;
+        }
+        continue;
+      }
+      arr.forEach((si, k) => {
+        segs[si].fan = Math.min((k + 1) * 3, 33);
+      });
+    }
+    /* رانش داخل‌خط تراورس‌ها حذف شد (v2c): پله‌های ورود/خروج صاف و عمودی
+       می‌مانند (درخواست کاربر)؛ پیشوندهای هم‌نقطه‌ شروع عملاً تک‌خط دیده
+       می‌شوند و در داور معاف‌اند. fanU فقط برای شعاعی‌های بیرون قطعه است. */
+    /* گسترش شعاعی‌های بیرون قطعه در راستای محور: ورود/خروج‌های روی‌هم‌خط
+       (دهانه، صفحه پیشانی) با رتبه سراسری (k+1)*3 جابه‌جا می‌شوند تا هیچ دو
+       خط اجراشده‌ای هم‌خط نماند (مرتب‌صعودی = خروجی اکیداً صعودی)؛
+       شعاعی‌های داخل قطعه (پاس‌های خشنه، حفره) دست‌نخورده‌اند */
+    const rad: { i: number; u: number }[] = [];
+    segs.forEach((sg, i) => {
+      if (sg.motion !== 0 || sg.fanU) return;
+      const a = machineUV(sg.z1, sg.x1, sg.holder, p);
+      const b = machineUV(sg.z2, sg.x2, sg.holder, p);
+      if (Math.hypot(b.u - a.u, b.v - a.v) < 1e-9) return;
+      if (Math.abs(b.u - a.u) >= 1e-9) return;
+      const faceU = p.blankL + (sg.holder === 2 ? p.holder2.xOff : 0) + sx;
+      if (a.u < faceU - 1e-9) return;
+      /* استثنای پله ورود/خروج (درخواست کاربر): شعاعیِ زنجیره ورود/خروج
+         (فیدر در فاصله ≤۲ سگمنت: پلانج/رترکت مستقیم یا کریدور دهانه پشت
+         فانل) و حرکات sys دقیقاً مثل قبل (TRUE) می‌مانند تا پله‌ها محوری
+         باشند؛ روی‌هم‌افتادن‌شان پذیرفته است */
+      if (sg.op === "sys") return;
+      for (let j = Math.max(0, i - 2); j <= Math.min(segs.length - 1, i + 2); j++) {
+        if (segs[j].motion === 1) return;
+      }
+      /* شعاعیِ چسبیده به تراورسِ گسترش‌یافته هم معاف است، وگرنه پله ورود/خروج
+         هم‌زمان Δu و Δv می‌گیرد و در CIMCO مورب دیده می‌شود (تراورس‌ها در پاس
+         قبلی fan گرفته‌اند پس این آزمون نهایی است) */
+      const nbFan = (j: number) => j >= 0 && j < segs.length && segs[j].motion === 0 && (segs[j].fan ?? 0) !== 0;
+      if (nbFan(i - 1) || nbFan(i + 1)) return;
+      rad.push({ i, u: a.u });
+    });
+    rad.sort((p2, q) => p2.u - q.u || p2.i - q.i);
+    rad.forEach((e, k) => {
+      segs[e.i].fanU = (k + 1) * 3;
+    });
+  }
+
+  /* کلید پایدار هر خط (برای ویرایش مسیر): عملیات:شماره در آن عملیات */
+  {
+    const ctr = new Map<string, number>();
+    for (const sg of segs) {
+      const kk = sg.opId < 0 ? "sys" : String(sg.opId);
+      const n = ctr.get(kk) ?? 0;
+      ctr.set(kk, n + 1);
+      sg.ovrKey = `${kk}:${n}`;
+    }
+  }
+
+  /* قالب‌بندی خروجی بر اساس سبک انتخابی */
+  const lines = p.format === "modal" ? buildModalLines(segs, p) : buildStdLines(segs, p);
+
+  /* آمار */
+  let cutLen = 0;
+  let rapidLen = 0;
+  let timeSec = 0;
+  for (const s of segs) {
+    const d = Math.hypot(s.x2 - s.x1, s.z2 - s.z1);
+    if (s.motion === 1) {
+      cutLen += d;
+      timeSec += (d / Math.max(1, s.feed)) * 60;
+    } else {
+      rapidLen += d;
+      timeSec += (d / RAPID_RATE) * 60;
+    }
+  }
+  let vol = 0;
+  for (let i = 1; i < samples.length; i++) {
+    const dz = samples[i].z - samples[i - 1].z;
+    const rAvg = (samples[i].r + samples[i - 1].r) / 2;
+    vol += Math.PI * (R * R - rAvg * rAvg) * dz;
+  }
+  /* حجم گوشه‌های برداشته‌شده برای مقاطع غیر دایره‌ای (بین شعاع محیطی و محاطی) */
+  const envVol = rotationalEnvelope(p.blankD, p.blankShape);
+  if (envVol.hasCorners && envVol.outR > R) {
+    vol += Math.PI * (envVol.outR * envVol.outR - R * R) * p.blankL;
+  }
+  /* حجم حفره داخل کاسه */
+  if (innerSamples.length > 1) {
+    for (let i = 1; i < innerSamples.length; i++) {
+      const dz = Math.abs(innerSamples[i].z - innerSamples[i - 1].z);
+      const rAvg = (innerSamples[i].r + innerSamples[i - 1].r) / 2;
+      vol += Math.PI * rAvg * rAvg * dz;
+    }
+  }
+
+  return {
+    lines,
+    segs,
+    samples,
+    innerSamples,
+    cutLen,
+    rapidLen,
+    timeSec,
+    volumeCm3: vol / 1000,
+    roughLayers: p.ops.filter((o) => o.on && (o.type === "rough-d" || o.type === "rough-z" || o.type === "offset" || o.type === "inner-rough" || o.type === "inner-offset")).length,
+    format: p.format,
+  };
+}
+
+/* فیدر بهینه: وقتی simpleFeed روشن است، فیدر هر حرکت به یکی از دو فیدر اصلی  */
+/* (خشن برای عملیات‌های برداشت، پرداخت برای پرداخت و آفست) ساده می‌شود تا در  */
+/* جی‌کد فقط دو F باقی بماند و G1/F های تکراری حذف شوند.                     */
+const FINISH_KINDS: SegKind[] = ["finish", "offset", "boreoff", "borefin"];
+function normFeed(sg: Seg, p: Params): number {
+  const operationFeed = sg.kind === "rapid" ? undefined : p.feedByKind?.[sg.kind];
+  if (operationFeed != null && !sg.feedOvr) return Math.min(20000, Math.max(1, operationFeed));
+  if (sg.feedOvr || !p.simpleFeed) return sg.feed;
+  return FINISH_KINDS.includes(sg.kind) ? p.feedFinish : p.feedRough;
+}
+
+/* ---------------- پل امن تعویض هلدر (پس‌پردازنده) ---------------- */
+/* مختصات ماشین یک نقطه (با تبدیل هلدر دوم) — فضای مشترک هر دو فرمت:
+   u = محور طولی (modal X / std Z)، v = محور قطری (modal Y / std X) */
+/* خروجی شعاعی: Y = شعاع (مثل پیش‌نمایش و DXF)؛ آفست‌ها واحد ماشین‌اند و دست نمی‌خورند */
+export function machineUV(zw: number, xw: number, holder: 1 | 2, p: Params): { u: number; v: number } {
+  const sx = p.gcodeShiftX ?? 0;
+  const sy = p.gcodeShiftY ?? 0;
+  if (holder === 2) return { u: zw + p.holder2.xOff + sx, v: xw / 2 - p.holder2.yOff + sy };
+  return { u: zw + sx, v: xw / 2 + sy };
+}
+
+/* مختصات اجراشده یک سر سگمنت = مختصات ماشین + گسترش G0 (اگر روشن باشد).
+   پس‌پردازنده و پل‌ها همه با همین مختصات کار می‌کنند تا تداوم ماشین حفظ شود. */
+export function execUV(s: Seg, end: boolean, p: Params): { u: number; v: number } {
+  const m = machineUV(end ? s.z2 : s.z1, end ? s.x2 : s.x1, s.holder, p);
+  if (!s.fan && !s.fanU) return m;
+  return { u: m.u + (s.fanU ?? 0), v: m.v + (s.fan ?? 0) };
+}
+
+/* آستانه پرش: اگر نقطه پایان پست‌شده با نقطه شروع بعدی (در فضای ماشین)
+   بیش از این فاصله داشته باشد، پل امن تعویض هلدر درج می‌شود. */
+export const BRIDGE_MIN_JUMP = 10;
+
+export interface PlannedBridge {
+  atIndex: number; // پل قبل از سگمنت شماره چندم درج می‌شود
+  fromH: 1 | 2;
+  toH: 1 | 2;
+  from: { u: number; v: number }; // نقطه شروع پل (= پایان پست‌شده قبلی)
+  legs: { u: number; v: number }[]; // نقطه‌های میانی/پایانی (همه پله‌ها محوری)
+  /* جذب: اگر سگمنت بعد از پل، سریعِ محوریِ طولی باشد، پله ورود حذف می‌شود و
+     خودِ آن سگمنت (بلوک G0 خودش) مسیر ورود+سگمنت را یکجا طی می‌کند —
+     بدون برگشت (نوک) و بدون افتادن دو خط روی هم */
+  absorbed: boolean;
+}
+
+/* برنامه‌ریزی پل‌های امن: هر ناپیوستگی فضای ماشین (تعویض هلدر یا شروع
+   دور از خانه) با پله‌های محوری از گوشه امن به هم وصل می‌شود:
+   خروج در ارتفاع مبدأ تا بیرون همه محتوا، پیمایش در کریدور امن،
+   ورود در ارتفاع مقصد — بدون هیچ حرکت مورب از فضای قطعه.
+   سگمنت‌های صفر (بدون بلوک) در تشخیص ناپیوستگی نادیده گرفته می‌شوند. */
+export function planBridges(segs: Seg[], p: Params): {
+  tc: { u: number; v: number };
+  home: { u: number; v: number };
+  bridges: PlannedBridge[];
+} {
+  const n = segs.length;
+  const starts: { u: number; v: number }[] = new Array(n);
+  const ends: { u: number; v: number }[] = new Array(n);
+  let maxU = -Infinity;
+  let maxV = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const s = segs[i];
+    starts[i] = execUV(s, false, p);
+    ends[i] = execUV(s, true, p);
+    if (starts[i].u > maxU) maxU = starts[i].u;
+    if (starts[i].v > maxV) maxV = starts[i].v;
+    if (ends[i].u > maxU) maxU = ends[i].u;
+    if (ends[i].v > maxV) maxV = ends[i].v;
+  }
+  /* Home از منطق مسیر حذف شده است. مبنای سازگاری خروجی، خود نقطه شروع مسیر است
+     و گوشه امن فقط از قله‌های واقعی عملیات‌ها به‌علاوه safety ساخته می‌شود. */
+  const home = n ? { ...starts[0] } : { u: 0, v: 0 };
+  const tc = { u: (Number.isFinite(maxU)?maxU:0) + p.safety, v: (Number.isFinite(maxV)?maxV:0) + p.safety };
+  const bridges: PlannedBridge[] = [];
+  const jump = (a: { u: number; v: number }, b: { u: number; v: number }) => Math.hypot(a.u - b.u, a.v - b.v);
+  const JMIN = BRIDGE_MIN_JUMP / 2; // آستانه در واحد فایل (شعاعی)
+  const legsFor = (a: { u: number; v: number }, b: { u: number; v: number }, absorb: boolean, tcu: number, rd: number) => {
+    /* پل جذب‌نشده با رمپ وارد می‌شود (از ۳×k_b بالاتر، دقیق روی شروع سگمنت)
+       تا تراورس‌های ورود پل‌ها روی هم نیفتند؛ پل جذب‌شده دست‌نخورده است */
+    const ty = absorb ? b.v : b.v + rd;
+    const legs = [
+      { u: tcu, v: a.v + rd },
+      { u: tcu, v: ty },
+      { u: b.u, v: b.v },
+    ];
+    return absorb ? legs.slice(0, 2) : legs;
+  };
+  /* جذب مجاز است فقط وقتی سگمنت هدف، یک حرکت سریعِ غیرصفرِ محوریِ طولی باشد؛
+     در این صورت بلوک G0 خودش (از کریدور امن تا انتهای سگمنت) جای پله ورود
+     می‌نشیند. فیدرها (برش!) و حرکات شعاعی هرگز جذب نمی‌شوند. */
+  const absorbable = (j: number) =>
+    segs[j].motion === 0 && Math.abs(ends[j].v - starts[j].v) < 1e-9;
+  /* فقط سگمنت‌های غیرصفر (دارای بلوک) در تشخیص ناپیوستگی شرکت می‌کنند */
+  const nz: number[] = [];
+  for (let i = 0; i < n; i++) {
+    if (jump(starts[i], ends[i]) > 1e-9) nz.push(i);
+  }
+  const mkBridge = (atIndex: number, fromH: 1 | 2, toH: 1 | 2, from: { u: number; v: number }) => {
+    const b = starts[atIndex];
+    const absorb = absorbable(atIndex);
+    /* شماره پل k_b=bridges.length؛ با گسترش، کریدور هر پل k_b*3 جلوتر است تا
+       تراورس‌های پل‌ها روی هم نیفتند (پل اول k_b=0 دقیق = TRUE نما) */
+    const btcu = tc.u + (p.spreadG0 ? bridges.length * 3 : 0);
+    const rd = p.spreadG0 ? bridges.length * 3 : 0;
+    bridges.push({ atIndex, fromH, toH, from, legs: legsFor(from, b, absorb, btcu, rd), absorbed: absorb });
+  };
+  /* تشخیص ناپیوستگی روی مختصات پست‌شده (بدون گسترش): پل برای پرش قاب هلدر است؛
+     اختلاف سطح گسترش (همان خط، چند میلی‌متر بالاتر) با پله محوری پوشش داده
+     می‌شود نه با پل. پله‌های پل روی مختصات اجراشده (با گسترش) می‌نشینند. */
+  const pstart = (j: number) => machineUV(segs[j].z1, segs[j].x1, segs[j].holder, p);
+  const pend = (j: number) => machineUV(segs[j].z2, segs[j].x2, segs[j].holder, p);
+  /* برای آغاز مسیر هرگز پل ساخته نمی‌شود؛ نخستین G0 خود نقطه شروع قطعی است. */
+  for (let k = 1; k < nz.length; k++) {
+    const i = nz[k];
+    const pv = nz[k - 1];
+    if (jump(pend(pv), pstart(i)) > JMIN) {
+      mkBridge(i, segs[pv].holder, segs[i].holder, ends[pv]);
+    }
+  }
+  return { tc, home, bridges };
+}
+
+/* ---------------- پس‌پردازندهٔ استاندارد Fanuc ---------------- */
+
+function buildStdLines(segs: Seg[], p: Params): string[] {
+  const lines: string[] = [];
+  let nWord = 0;
+  const emit = (code: string) => {
+    lines.push(p.lineNumbers ? `N${(nWord += 10)} ${code}` : code);
+    return lines.length - 1;
+  };
+  lines.push("%");
+  lines.push("O1001 (KHARRATKOD - 2 AXIS WOOD LATHE)");
+  lines.push(`(STOCK D${p.blankD} x L${p.blankL} MM)`);
+  lines.push(`(TOOL: ${toolDesc(p.tool)})`);
+  lines.push(`(DOC OUT ${p.doc} MM - DOC INNER ${p.innerDoc} MM - OFFSET OUT ${p.offsetDist} MM - INNER ${p.innerOffsetDist} MM - INNER START ${p.innerStartClearance} MM - INNER END +X ${p.innerEndTravel} MM - BOTTOM/ROUGH OVERLAP ${p.bottomRoughOverlap} MM - BOTTOM/OFFSET CLEARANCE ${p.bottomOffsetClearance} MM)`);
+  const usesH2 = segs.some((s) => s.motion === 1 && s.holder === 2);
+  if (usesH2) {
+    lines.push(`(HOLDER2: XOFF ${p.holder2.xOff} YOFF ${p.holder2.yOff} ROT ${HOLDER2_ROT})`);
+    lines.push(`(H2 MAP: Xm = Xw + XOFF , Ym = Yw/2 - YOFF)`);
+  }
+  emit("G21 G18 G40");
+  const plan = planBridges(segs, p);
+  const bridgeAt = new Map<number, PlannedBridge>();
+  for (const b of plan.bridges) bridgeAt.set(b.atIndex, b);
+  /* ردیابی موقعیت ماشین روی مختصات اجراشده (ماشین + گسترش G0) */
+  /* با گسترشِ روشن، شروعِ اجراشده سگمنت اول با خانه فرق دارد پس ردیابی از خانه
+     آغاز می‌شود تا پله خانه→شروع صادر شود؛ خاموش = رفتار legacy بایت‌به‌بایت */
+  /* نخستین سگمنت G0 خودش نقطه شروع صریح برنامه است؛ حتی با Spread نباید
+     پیش از آن یک G0 جداگانه از Home تولید شود. */
+  const fromHome = !segs.length;
+  let mu = fromHome ? plan.home.u : execUV(segs[0], false, p).u;
+  let mv = fromHome ? plan.home.v : execUV(segs[0], false, p).v;
+  let lastFeed = -1;
+  for (let i = 0; i < segs.length; i++) {
+    const sg = segs[i];
+    const e1 = execUV(sg, false, p);
+    const e2 = execUV(sg, true, p);
+    const br = bridgeAt.get(i);
+    if (br) {
+      /* ناپیوستگی فضای ماشین (تعویض هلدر): پله‌های محوری از گوشه امن */
+      if (!(br.fromH === 2 && br.toH === 1)) lines.push(`(HOLDER ${br.fromH} -> ${br.toH})`);
+      let pu = br.from.u;
+      let pv = br.from.v;
+      for (let j = 0; j < br.legs.length; j++) {
+        const leg = br.legs[j];
+        if (Math.hypot(leg.u - pu, leg.v - pv) < 1e-9) continue;
+        const move = sg.bridgeMoves?.[j];
+        if (move?.motion === 1) {
+          const F = Math.max(1, Math.round(move.feed));
+          emit(`G1 X${f2(leg.v)} Z${f2(leg.u)} F${F}`);
+          lastFeed = F;
+        } else emit(`G0 X${f2(leg.v)} Z${f2(leg.u)}`);
+        pu = leg.u;
+        pv = leg.v;
+        mu = leg.u;
+        mv = leg.v;
+      }
+    }
+    /* پله گسترش: اگر شروع اجراشده با موقعیت ماشین فرق دارد (تغییر سطح گسترش)،
+       اول با یک G0 به آن می‌رویم؛ بدون گسترش همیشه صفر است و بلوکی صادر نمی‌شود.
+       برای سگمنت جذب‌شده پله نداریم — بلوک خودش از انتهای پل شروع می‌شود. */
+    if (!(br && br.absorbed) && Math.hypot(e1.u - mu, e1.v - mv) > 1e-9) {
+      const move = sg.bridgeMoves?.[8];
+      if (move?.motion === 1) {
+        const F = Math.max(1, Math.round(move.feed));
+        emit(`G1 X${f2(e1.v)} Z${f2(e1.u)} F${F}`);
+        lastFeed = F;
+      } else emit(`G0 X${f2(e1.v)} Z${f2(e1.u)}`);
+      mu = e1.u;
+      mv = e1.v;
+    }
+    if (sg.note) for (const c of sg.note) lines.push(`(${c})`);
+    if (sg.motion === 0) {
+      sg.line = emit(`G0 X${f2(e2.v)} Z${f2(e2.u)}`);
+    } else {
+      const F = Math.max(1, Math.round(normFeed(sg, p)));
+      /* در حالت فیدر بهینه، F فقط هنگام تغییر تکرار می‌شود وگرنه حذف می‌شود */
+      const fWord = sg.forceFeed || !p.simpleFeed || F !== lastFeed ? ` F${F}` : "";
+      lastFeed = F;
+      sg.line = emit(`G1 X${f2(e2.v)} Z${f2(e2.u)}${fWord}`);
+    }
+    mu = e2.u;
+    mv = e2.v;
+    if (i === 0) {
+      emit(`M3 S${Math.round(p.rpm)}`);
+      emit("G4 P2");
+    }
+  }
+  emit("M5");
+  emit("M30");
+  lines.push("%");
+  return lines;
+}
+
+/* ------------- پس‌پردازندهٔ فشرده Modal (سبک نمونهٔ کاربر) ------------- */
+/* G90/G49 ، مختصات سه‌دهک، حذف G مودال در خطوط ادامه، تغییر فیدر در خط     */
+/* جدا، پایان با M05/M02 — دستگاه مختصات XY (صفحه G17):                    */
+/* X = طول قطعه (افقی) ، Y = قطر (عمودی) → نمای XY در CIMCO دقیقاً مطابق  */
+/* پیش‌نمایش نرم‌افزار: قطعه افقی، پروفایل بالای محور طول                   */
+
+function buildModalLines(segs: Seg[], p: Params): string[] {
+  const lines: string[] = ["%", "G90", "G49", `M3 S${Math.round(p.rpm)}`];
+  const f3 = (v: number) => v.toFixed(3);
+  let mode: -1 | 0 | 1 = -1;
+  let mFeed = -1;
+  let lastOp: OpType | "sys" = "sys";
+  let lastHolder: 1 | 2 = 1;
+  /* جست‌وجوی خانه با نقطه کامل: مختصات مودال دستگاه را صراحتاً روی نقطه خانه
+     می‌نشاند تا موقعیت شروع اولین حرکت، هرگز از وضعیت قبلی دستگاه به ارث نرسد */
+  const plan = planBridges(segs, p);
+  const bridgeAt = new Map<number, PlannedBridge>();
+  for (const b of plan.bridges) bridgeAt.set(b.atIndex, b);
+  /* نخستین G0 مستقیماً نقطه شروع ۵mm بالای اولین خط است؛ Home جداگانه صادر
+     نمی‌شود تا آغاز برنامه دقیقاً یک خط G0 داشته باشد. */
+  let mu = segs.length ? execUV(segs[0],false,p).u : plan.home.u;
+  let mv = segs.length ? execUV(segs[0],false,p).v : plan.home.v;
+  for (let i = 0; i < segs.length; i++) {
+    const sg = segs[i];
+    const e1 = execUV(sg, false, p);
+    const e2 = execUV(sg, true, p);
+    if (sg.op !== lastOp || sg.holder !== lastHolder) lines.push("");
+    lastOp = sg.op;
+    lastHolder = sg.holder;
+    const br = bridgeAt.get(i);
+    if (br) {
+      /* ناپیوستگی فضای ماشین (تعویض هلدر): پله‌های محوری از گوشه امن */
+      if (!(br.fromH === 2 && br.toH === 1)) lines.push(`(HOLDER ${br.fromH} -> ${br.toH})`);
+      let pu = br.from.u;
+      let pv = br.from.v;
+      for (let j = 0; j < br.legs.length; j++) {
+        const leg = br.legs[j];
+        if (Math.hypot(leg.u - pu, leg.v - pv) < 1e-9) continue;
+        const move = sg.bridgeMoves?.[j];
+        if (move?.motion === 1) {
+          const F = Math.max(1, Math.round(move.feed));
+          lines.push(`G1 X${f3(leg.u)} Y${f3(leg.v)} F${F}`);
+          mode = 1;
+          mFeed = F;
+        } else {
+          lines.push(`G0 X${f3(leg.u)} Y${f3(leg.v)}`);
+          mode = 0;
+        }
+        pu = leg.u;
+        pv = leg.v;
+        mu = leg.u;
+        mv = leg.v;
+      }
+    }
+    /* پله گسترش: اگر شروع اجراشده با موقعیت ماشین فرق دارد (تغییر سطح گسترش)،
+       اول با یک G0 به آن می‌رویم؛ بدون گسترش همیشه صفر است و بلوکی صادر نمی‌شود.
+       برای سگمنت جذب‌شده پله نداریم — بلوک خودش از انتهای پل شروع می‌شود. */
+    if (!(br && br.absorbed) && Math.hypot(e1.u - mu, e1.v - mv) > 1e-9) {
+      const sw: string[] = [];
+      if (Math.abs(e1.u - mu) > 1e-9) sw.push(`X${f3(e1.u)}`);
+      if (Math.abs(e1.v - mv) > 1e-9) sw.push(`Y${f3(e1.v)}`);
+      const move = sg.bridgeMoves?.[8];
+      if (move?.motion === 1) {
+        const F = Math.max(1, Math.round(move.feed));
+        lines.push(`G1 ${sw.join(" ")} F${F}`);
+        mode = 1;
+        mFeed = F;
+      } else {
+        lines.push(`G0 ${sw.join(" ")}`);
+        mode = 0;
+      }
+      mu = e1.u;
+      mv = e1.v;
+    }
+    const words: string[] = [];
+    if (Math.abs(e2.u - mu) > 1e-9) words.push(`X${f3(e2.u)}`);
+    if (Math.abs(e2.v - mv) > 1e-9) words.push(`Y${f3(e2.v)}`);
+    if (words.length === 0) {
+      if(i===0&&sg.motion===0){
+        /* سگمنت صفرطول نخست یک حرکت هندسی نیست، اما مختصات آغاز صریح دستگاه
+           است و باید دقیقاً به‌صورت یک بلوک کامل G0 صادر شود. */
+        lines.push(`G0 X${f3(e2.u)} Y${f3(e2.v)}`);
+        mode=0;
+        sg.line=lines.length-1;
+      }else sg.line = lines.length - 1;
+      continue;
+    }
+    if (sg.motion === 0) {
+      lines.push(`G0 ${words.join(" ")}`);
+      mode = 0;
+    } else {
+      const F = Math.max(1, Math.round(normFeed(sg, p)));
+      const fChanged = sg.forceFeed || F !== mFeed;
+      /* فیدر مودال است؛ فقط هنگام تغییر مقدار صادر می‌شود و به خط حرکت می‌چسبد — */
+      /* در نتیجه G1/F های تکراری حذف و فقط دو F اصلی باقی می‌ماند.             */
+      const gPrefix = mode !== 1 ? "G1 " : "";
+      const fSuffix = fChanged ? ` F${F}` : "";
+      lines.push(`${gPrefix}${words.join(" ")}${fSuffix}`);
+      if (fChanged) mFeed = F;
+      mode = 1;
+    }
+    sg.line = lines.length - 1;
+    mu = e2.u;
+    mv = e2.v;
+  }
+  lines.push("", "M05", "M02", "%");
+  return lines;
+}
+
+/* ---------------- پیش‌تنظیم‌ها ---------------- */
+
+export interface Preset {
+  id: string;
+  name: string;
+  blankD: number;
+  blankL: number;
+  pts: [number, number, boolean][]; // z, r, smooth
+  /** بوم طراحی عمداً بدون هیچ المانی باز شود. */
+  empty?: boolean;
+  /** زنجیره دیواره کاسه به ترتیب مسیر: خارج → لبه → داخل (فقط پریست کاسه) */
+  wall?: [number, number, boolean][];
+  /** هندسه دقیق ویرایشگر برای پریست‌هایی که با نقاط Smooth قابل بازسازی نیستند. */
+  sketch?: Array<{
+    kind: "line" | "quad" | "cubic" | "arc";
+    a: { z: number; r: number };
+    b: { z: number; r: number };
+    c1?: { z: number; r: number };
+    c2?: { z: number; r: number };
+    via?: { z: number; r: number };
+    polylineId?: number;
+  }>;
+  /** نقطه Split پیشنهادی روی دیواره */
+  split?: { z: number; r: number };
+  /** استراتژی پیشنهادی هنگام اعمال پریست */
+  strategy?: string;
+  /** تنظیمات اختصاصی پروژه که همراه هندسهٔ پیش‌تنظیم اعمال می‌شوند. */
+  params?: Partial<Params>;
+  /** شکل مقطع خام پیش‌فرض؛ برای همهٔ پیش‌تنظیم‌ها صریحاً تعیین می‌شود. */
+  shape: BlankShape;
+}
+
+export const PRESETS: Preset[] = [
+  {
+    id: "leg",
+    name: "پایه مبل",
+    blankD: 60,
+    blankL: 200,
+    shape: "square",
+    pts: [
+      [0, 22, false], [10, 22, false], [16, 29, true], [30, 29, true],
+      [42, 17, true], [54, 17, true], [62, 27, true], [76, 27, true],
+      [86, 13, true], [98, 13, true], [106, 24, true], [122, 24, true],
+      [132, 15, true], [146, 15, true], [154, 27, true], [172, 27, true],
+      [180, 19, true], [192, 19, true], [200, 22, false],
+    ],
+  },
+  {
+    id: "vase",
+    name: "گلدان",
+    blankD: 64,
+    blankL: 200,
+    shape: "square",
+    pts: [
+      [0, 9, true], [8, 14, true], [20, 24, true], [36, 30, true],
+      [54, 27, true], [76, 15, true], [96, 10, true], [114, 11, true],
+      [132, 19, true], [150, 26, true], [164, 24, true], [176, 15, true],
+      [186, 9, true], [194, 7, true], [200, 8, false],
+    ],
+  },
+  {
+    id: "bowl",
+    name: "پیاله",
+    blankD: 150,
+    blankL: 90,
+    shape: "square",
+    pts: [
+      [0, 10, true], [12, 22, true], [30, 42, true], [52, 58, true],
+      [70, 67, true], [82, 71, true], [90, 72, false],
+    ],
+  },
+  {
+    id: "bowl-both",
+    name: "کاسه (داخل+خارج)",
+    blankD: 150,
+    blankL: 90,
+    shape: "square",
+    strategy: "bowl",
+    split: { z: 90, r: 68 },
+    pts: [
+      [0, 16, false], [8, 19, true], [18, 27, true], [32, 41, true], [48, 54, true],
+      [62, 63, true], [74, 69, true], [84, 71.5, true], [90, 72, false],
+    ],
+    wall: [
+      /* شاخه خارجی: از کف تا لبه بیرونی */
+      [0, 16, false], [8, 19, true], [18, 27, true], [32, 41, true], [48, 54, true],
+      [62, 63, true], [74, 69, true], [84, 71.5, true], [90, 72, false],
+      /* ضخامت لبه */
+      [90, 64, false],
+      /* شاخه داخلی: از لبه داخلی تا کف حفره */
+      [82, 61, true], [70, 55, true], [56, 45, true], [42, 32, true],
+      [32, 20, true], [26, 10, true], [24, 4, false],
+    ],
+  },
+  {
+    id: "cup",
+    name: "لیوان",
+    blankD: 80,
+    blankL: 70,
+    shape: "square",
+    strategy: "bowl",
+    split: { z: 59.54363814753165, r: 29.086948102923298 },
+    pts: [[0,12,false],[0,22,false],[10,32,true],[55,32,false],[60,27,true],[60,26,false],[56,22,true],[20,22,false],[10,12,true],[10,0,false]],
+    sketch: [
+      { kind: "line", a: { z: 0, r: 12 }, b: { z: 0, r: 22 }, polylineId: 6850 },
+      { kind: "line", a: { z: 10.000000000000002, r: 32 }, b: { z: 55, r: 32 }, polylineId: 6850 },
+      { kind: "line", a: { z: 60, r: 27 }, b: { z: 60, r: 26 }, polylineId: 6850 },
+      { kind: "line", a: { z: 56, r: 22 }, b: { z: 20, r: 22 }, polylineId: 6850 },
+      { kind: "line", a: { z: 10, r: 11.999999999999998 }, b: { z: 10, r: 0 }, polylineId: 6850 },
+      { kind: "arc", a: { z: 60, r: 27 }, b: { z: 55, r: 32 }, via: { z: 58.53553390593274, r: 30.535533905932738 } },
+      { kind: "arc", a: { z: 10.000000000000002, r: 32 }, b: { z: 0, r: 22 }, via: { z: 2.9289321881345245, r: 29.07106781186548 } },
+      { kind: "arc", a: { z: 56, r: 22 }, b: { z: 60, r: 26 }, via: { z: 58.82842712474619, r: 23.17157287525381 } },
+      { kind: "arc", a: { z: 10, r: 11.999999999999998 }, b: { z: 20, r: 22 }, via: { z: 12.928932188134521, r: 19.071067811865476 } },
+    ],
+    params: {
+      doc: 3,
+      innerDoc: 3,
+      offsetDist: 0.5,
+      innerOffsetDist: 0.5,
+      innerStartClearance: 2,
+      innerEndTravel: 300,
+      bottomRoughOverlap: 3,
+      bottomOffsetClearance: 0,
+      feedRough: 220,
+      feedFinish: 110,
+      rpm: 1500,
+      tool: { type: "angle", hand: "center", angle: 35, nose: 0.2, size: 16, radius: 6, width: 3, corner: 0.2, shank: 12 },
+      safety: 2,
+      roughMode: "zone",
+      innerRoughMode: "zone",
+      innerZoneOrder: [0],
+      innerZoneBounds: [],
+      ramp: true,
+      safeBottomInnerLink: true,
+      simpleFeed: true,
+      zoneOrder: [0],
+      zoneBounds: [],
+      lineNumbers: true,
+      format: "modal",
+      spreadG0: false,
+      holder2: { xOff: 92, yOff: 68 },
+      ops: [
+        { id: 48, type: "round", on: true, reverse: false, holder: 1 },
+        { id: 50, type: "rough-d", on: true, reverse: false, holder: 1 },
+        { id: 51, type: "offset", on: true, reverse: false, holder: 1 },
+        { id: 52, type: "finish", on: true, reverse: false, holder: 1 },
+        { id: 53, type: "bottom", on: true, reverse: false, holder: 2 },
+        { id: 54, type: "inner-rough", on: true, reverse: false, holder: 2 },
+        { id: 55, type: "inner-offset", on: true, reverse: false, holder: 2 },
+        { id: 56, type: "inner-finish", on: true, reverse: false, holder: 2 },
+      ],
+    },
+  },
+  {
+    id: "inner-arc",
+    name: "قوس داخلی",
+    blankD: 150,
+    blankL: 90,
+    shape: "square",
+    strategy: "bowl",
+    split: { z: 79.9758998319284, r: 50.0316974402297 },
+    /* pts فقط برای بندانگشتی است؛ شکل واقعی از sketch دقیق زیر ساخته می‌شود. */
+    pts: [[0,0,false],[20,22,true],[42,43,true],[64,52,true],[80,50,false]],
+    sketch: [
+      {
+        kind: "cubic",
+        a: { z: 0, r: 0 }, b: { z: 80, r: 50 },
+        c1: { z: -0.001953125, r: 56 }, c2: { z: 42, r: 100 },
+      },
+      {
+        kind: "cubic",
+        a: { z: 13, r: 1 }, b: { z: 77, r: 48 },
+        c1: { z: 15, r: 62 }, c2: { z: 51, r: 75 },
+      },
+      {
+        kind: "arc",
+        a: { z: 77, r: 48 }, b: { z: 80, r: 50 }, via: { z: 80, r: 48 },
+      },
+    ],
+  },
+  {
+    id: "custom-project-3",
+    name: "طرح سفارشی ۳",
+    blankD: 200,
+    blankL: 90,
+    shape: "square",
+    strategy: "bowl",
+    split: { z: 64.51035778909231, r: 88.64065309179512 },
+    /* هندسه دقیق فایل project(3)، شامل منحنی‌ها و دو Polyline داخلی. */
+    pts: [[0,66,false],[18,88,true],[45,94,true],[68,84,true],[71,81,false]],
+    sketch: [
+      { kind: "line", a: { z: 0, r: 0 }, b: { z: 0, r: 66 } },
+      { kind: "cubic", a: { z: 0, r: 66 }, b: { z: 67.62462364355223, r: 84.19182880685447 }, c1: { z: -0.0021391051206346434, r: 89.30455724402302 }, c2: { z: 68, r: 98.46142578125 } },
+      { kind: "cubic", a: { z: 44.8, r: 60.7 }, b: { z: 29.990484516107415, r: 59.93037758803072 }, c1: { z: 39.990484516107415, r: 52.93037758803072 }, c2: { z: 36.990484516107415, r: 49.93037758803072 } },
+      { kind: "cubic", a: { z: 29.990484516107415, r: 59.93037758803072 }, b: { z: 12.990484516107415, r: 58.93037758803072 }, c1: { z: 23.990484516107415, r: 70.93037758803071 }, c2: { z: 20.990484516107415, r: 73.93037758803072 } },
+      { kind: "cubic", a: { z: 73, r: 72 }, b: { z: 84, r: 62 }, c1: { z: 73, r: 69 }, c2: { z: 75, r: 62 } },
+      { kind: "cubic", a: { z: 84, r: 62 }, b: { z: 83, r: 51 }, c1: { z: 89, r: 62 }, c2: { z: 90, r: 51 } },
+      { kind: "line", a: { z: 83, r: 51 }, b: { z: 70, r: 51 }, polylineId: 9763 },
+      { kind: "line", a: { z: 70, r: 51 }, b: { z: 70, r: 68 }, polylineId: 9763 },
+      { kind: "line", a: { z: 70, r: 68 }, b: { z: 60, r: 68 }, polylineId: 9763 },
+      { kind: "line", a: { z: 60, r: 68 }, b: { z: 60, r: 56 }, polylineId: 9763 },
+      { kind: "line", a: { z: 60, r: 56 }, b: { z: 50, r: 71 }, polylineId: 9763 },
+      { kind: "line", a: { z: 50, r: 71 }, b: { z: 44.8, r: 60.7 }, polylineId: 9763 },
+      { kind: "line", a: { z: 12.990484516107415, r: 58.93037758803072 }, b: { z: 21, r: 47 } },
+      { kind: "line", a: { z: 21, r: 47 }, b: { z: 10, r: 41 } },
+      { kind: "cubic", a: { z: 10, r: 41 }, b: { z: 10, r: 21 }, c1: { z: 31, r: 38 }, c2: { z: 56, r: 30 } },
+      { kind: "line", a: { z: 10, r: 21 }, b: { z: 10, r: 0 } },
+      { kind: "line", a: { z: 67.62462364355223, r: 84.19182880685447 }, b: { z: 71, r: 84.19182880685447 } },
+      { kind: "line", a: { z: 71, r: 84.19182880685447 }, b: { z: 71, r: 81 } },
+      { kind: "line", a: { z: 71, r: 81 }, b: { z: 67, r: 81 } },
+      { kind: "line", a: { z: 67, r: 81 }, b: { z: 67, r: 75 }, polylineId: 12065 },
+      { kind: "line", a: { z: 67, r: 75 }, b: { z: 73, r: 75 }, polylineId: 12065 },
+      { kind: "line", a: { z: 73, r: 75 }, b: { z: 73, r: 72 }, polylineId: 12065 },
+    ],
+  },
+  {
+    id: "inner-rough-test",
+    name: "تست خشن داخل عمودی",
+    blankD: 1000,
+    blankL: 100,
+    shape: "circle",
+    strategy: "bowl",
+    split: { z: 66, r: 420 },
+    pts: [
+      [0, 365, false], [8, 420, true], [22, 462, true], [40, 475, true],
+      [56, 460, true], [66, 420, false],
+    ],
+    wall: [
+      /* بیرون قطعه تا لبه */
+      [0, 365, false], [8, 420, true], [22, 462, true], [40, 475, true],
+      [56, 460, true], [66, 420, false],
+      /* دیواره داخلی زیگزاگی برای آزمون قله‌ها و بازه‌های عمودی */
+      [60, 365, false], [34, 315, false], [54, 245, false], [30, 190, false],
+      [54, 125, false], [30, 65, false], [54, 2, false],
+    ],
+  },
+  {
+    id: "baluster",
+    name: "ستون نرده",
+    blankD: 70,
+    blankL: 240,
+    shape: "square",
+    pts: [
+      [0, 18, false], [8, 24, true], [18, 24, true], [26, 32, true],
+      [40, 32, true], [50, 20, true], [62, 14, true], [76, 14, true],
+      [86, 26, true], [100, 33, true], [116, 33, true], [126, 22, true],
+      [138, 15, true], [152, 15, true], [162, 28, true], [178, 34, true],
+      [194, 34, true], [204, 21, true], [216, 15, true], [228, 15, true],
+      [234, 20, true], [240, 18, false],
+    ],
+  },
+  {
+    id: "bead",
+    name: "مهره تسبیح",
+    blankD: 40,
+    blankL: 60,
+    shape: "square",
+    pts: [
+      [0, 5, true], [8, 11, true], [18, 17, true], [30, 19, true],
+      [42, 17, true], [52, 11, true], [60, 5, true],
+    ],
+  },
+  {
+    id: "cyl",
+    name: "استوانه خام",
+    blankD: 60,
+    blankL: 180,
+    shape: "square",
+    pts: [
+      [0, 30, false], [180, 30, false],
+    ],
+  },
+  {
+    id: "empty-100",
+    name: "طرح خالی ۱۰×۱۰",
+    blankD: 100,
+    blankL: 100,
+    shape: "square",
+    empty: true,
+    pts: [],
+  },
+];
+
+let uid = 1000;
+export const nextId = () => ++uid;
+
+export function presetPoints(p: Preset): PPoint[] {
+  return p.pts.map(([z, r, smooth]) => ({ id: nextId(), z, r, smooth }));
+}
+
+/* مسیر SVG برای بندانگشتی پیش‌تنظیم‌ها */
+export function thumbPath(p: Preset, w: number, h: number): string {
+  const R = p.blankD / 2;
+  const sx = (z: number) => 3 + (z / p.blankL) * (w - 6);
+  const sy = (r: number) => h / 2 - (r / R) * (h / 2 - 3);
+  const loop = (pts: [number, number][]): string => {
+    let d = `M ${sx(pts[0][0]).toFixed(1)} ${sy(pts[0][1]).toFixed(1)}`;
+    for (let i = 1; i < pts.length; i++) d += ` L ${sx(pts[i][0]).toFixed(1)} ${sy(pts[i][1]).toFixed(1)}`;
+    for (let i = pts.length - 1; i >= 0; i--) d += ` L ${sx(pts[i][0]).toFixed(1)} ${(h - sy(pts[i][1])).toFixed(1)}`;
+    return d + " Z";
+  };
+  if (p.empty || p.pts.length === 0) {
+    /* بندانگشتی بوم خالی فقط محدودهٔ خام ۱۰×۱۰ را نشان می‌دهد. */
+    return `M 3 3 H ${w - 3} V ${h - 3} H 3 Z`;
+  }
+  /* کاسه: حلقه ماده + حلقه حفره (با fill-rule evenodd حفره خالی دیده می‌شود) */
+  if (p.wall && p.split) {
+    const wall2: [number, number][] = p.wall.map(([z, r]) => [z, r]);
+    /* شروع شاخه داخلی = جایی که مسیر در Z برمی‌گردد (لبه)؛ وگرنه نزدیک‌ترین رأس */
+    let bi = -1;
+    for (let i = 0; i < wall2.length - 1; i++) {
+      if (wall2[i + 1][0] < wall2[i][0] - 1e-6) {
+        bi = i + 1;
+        break;
+      }
+    }
+    if (bi < 0) {
+      let bd = Infinity;
+      wall2.forEach(([z, r], i) => {
+        const d = Math.hypot(z - p.split!.z, r - p.split!.r);
+        if (d < bd) {
+          bd = d;
+          bi = i;
+        }
+      });
+    }
+    const inner = wall2.slice(bi).map(([z, r]): [number, number] => [z, Math.max(0.5, r)]);
+    if (inner.length >= 2) return `${loop(wall2)} ${loop(inner)}`;
+    return loop(wall2);
+  }
+  const pts = p.pts;
+  return loop(pts.map(([z, r]): [number, number] => [z, r]));
+}
+
+export function fmtTime(sec: number): string {
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  if (m >= 60) return `${Math.floor(m / 60)}س ${m % 60}د`;
+  return m > 0 ? `${m}د و ${s}ث` : `${s} ثانیه`;
+}
+
+/* ================= ویرایشِ خطوط جی‌کد (حالت ویرایش مسیر) =================
+   هر خطِ خروجی کلیدِ ovrKey دارد؛ ویرایش‌ها به‌صورتِ مطلق (مختصات کارِ
+   z/r با X قطری) روی همان کلید ذخیره و برنامه از نو ساخته می‌شود:
+   - خطِ حذف‌شده (del) از برنامه بیرون می‌رود؛
+   - اگر بعدِ ویرایش، سرِ یک حرکت بُرش از انتهای حرکت قبلی باز باشد،
+     یک حرکتِ اتصالِ سریع (G0) خودکار تزریق می‌شود (اتصال ناقص نمی‌ماند)؛
+   - حرکات صفرطول (نقاطِ هم‌مکان) حذف می‌شوند (خط/نقطهٔ اضافی نمی‌ماند). */
+
+export interface GcodeOvrPt {
+  z: number;
+  x: number;
+}
+export interface GcodeOvr {
+  s?: GcodeOvrPt;
+  e?: GcodeOvrPt;
+  /** نقاط میانی برای شکستن یک حرکت به چند Segment پیوسته */
+  via?: GcodeOvrPt[];
+  /** نوع حرکت و فید هر قطعه؛ هم‌ردیف با Segmentهای ساخته‌شده از s/via/e */
+  moves?: { motion: 0 | 1; feed: number }[];
+  /** تغییر پله‌های مصنوعی اتصال/نزدیک‌شدن که پیش از سگمنت پایه ساخته می‌شوند. */
+  bridgeMoves?: Record<number, { motion: 0 | 1; feed: number }>;
+  del?: boolean;
+}
+export type GcodeOvrMap = Record<string, GcodeOvr>;
+
+export function applyGcodeOvr(base: GenResult, ovr: GcodeOvrMap, p: Params): GenResult {
+  if (!Object.keys(ovr).length) return base;
+  const expanded: Seg[] = [];
+  const firstCutBase=base.segs.find(segment=>segment.motion===1);
+  const initialBase=base.segs[0];
+  const initialOvr=initialBase?.ovrKey?ovr[initialBase.ovrKey]:undefined;
+  /* در مدل نمایشی، S رأس آغاز خط G0 است؛ مختصات فرمان خط ۶ اما مقصد G0 است.
+     بنابراین Drag رأس S باید هم مقصد G0 و هم مبدأ نخستین G1 را جابه‌جا کند. */
+  const draggedProgramStart=initialBase?.motion===0?initialOvr?.s:undefined;
+  for (let baseIndex=0;baseIndex<base.segs.length;baseIndex++) {
+    const sg0=base.segs[baseIndex];
+    const o = sg0.ovrKey ? ovr[sg0.ovrKey] : undefined;
+    /* فرمان G0 آغاز برنامه روی S و با مختصات ویرایش‌شده نوشته می‌شود. این کار
+       مانع ثابت‌ماندن X خط ۶ روی صفر پس از Drag و تأیید است. */
+    if(baseIndex===0&&sg0.motion===0&&draggedProgramStart){
+      expanded.push({...sg0,z1:draggedProgramStart.z,x1:draggedProgramStart.x,z2:draggedProgramStart.z,x2:draggedProgramStart.x});
+      continue;
+    }
+    if (o?.del) continue;
+    const forcedStart=draggedProgramStart&&sg0===firstCutBase?draggedProgramStart:undefined;
+    const points = [forcedStart??o?.s ?? { z: sg0.z1, x: sg0.x1 }, ...(o?.via ?? []), o?.e ?? { z: sg0.z2, x: sg0.x2 }];
+    for (let i = 1; i < points.length; i++) {
+      const a = points[i - 1], b = points[i];
+      if (Math.hypot(b.z - a.z, b.x - a.x) < 1e-6) continue;
+      const move = o?.moves?.[i - 1];
+      const motion = move?.motion ?? sg0.motion;
+      const feed = motion === 0 ? RAPID_RATE : (move?.feed ?? sg0.feed);
+      expanded.push({ ...sg0, motion, feed, feedOvr: !!move, bridgeMoves: i === 1 ? o?.bridgeMoves : undefined, z1: a.z, x1: a.x, z2: b.z, x2: b.x, note: i === 1 ? sg0.note : undefined });
+    }
+  }
+  const kept: Seg[] = [];
+  for (const sg0 of expanded) {
+    const sg = { ...sg0 };
+    const prev = kept[kept.length - 1];
+    if (prev && sg.motion === 1 && (Math.abs(sg.z1 - prev.z2) > 1e-6 || Math.abs(sg.x1 - prev.x2) > 1e-6)) {
+      if (prev.motion === 0) {
+        prev.z2 = sg.z1;
+        prev.x2 = sg.x1;
+        if (Math.hypot(prev.z2 - prev.z1, prev.x2 - prev.x1) < 1e-6) kept.pop();
+      } else {
+        kept.push({ ...sg, motion: 0, feed: RAPID_RATE, kind: "rapid", opId: -1, op: "sys", note: undefined, fan: undefined, fanU: undefined, z1: prev.z2, x1: prev.x2, z2: sg.z1, x2: sg.x1, line: -1, holder: sg.holder, ovrKey: undefined });
+      }
+    }
+    kept.push(sg);
+  }
+  const lines = p.format === "modal" ? buildModalLines(kept, p) : buildStdLines(kept, p);
+  let cutLen = 0, rapidLen = 0, timeSec = 0;
+  for (const sg of kept) {
+    const d = Math.hypot(sg.x2 - sg.x1, sg.z2 - sg.z1);
+    if (sg.motion === 1) { cutLen += d; timeSec += (d / Math.max(1, sg.feed)) * 60; }
+    else { rapidLen += d; timeSec += (d / RAPID_RATE) * 60; }
+  }
+  return { ...base, segs: kept, lines, cutLen, rapidLen, timeSec };
+}
+
+/* ---------- بافرِ «ویرایش مسیر» — پلی‌لاینِ پیوسته با رأس‌های مشترک ----------
+   مدل مثل بک‌پلات CIMCO: کل مسیر، یک زنجیرۀ یکپارچه است. نقاط (verts)
+   موجودیت‌های مستقل‌اند و هر خط به دو رأس ارجاع می‌دهد؛ جابه‌جایی یک رأس
+   خودبه‌خود همهٔ خطوطِ متصل را با خود می‌برد (بدای نقطهٔ دوم و بدون گسست)
+   و حذفِ رأس، دو خطِ هم‌رس را در یک خط ادغام می‌کند. */
+
+export interface EVert {
+  id: number;
+  z: number; // mm محوری
+  x: number; // قطر (mm) — همان Xِ برنامه
+}
+
+export interface ELine {
+  id: number;
+  key: string; // ovrKeyِ خطِ پایه (پل‌های تزریق‌شده کلید واقعی ندارند)
+  va: number; // رأس مبدأ
+  vb: number; // رأس مقصد
+  motion: 0 | 1;
+  feed: number;
+  feedOvr?: boolean;
+  opId: number; // -۱ = سیستمی (نزدیک‌سازی/امنیت)
+  kind: SegKind;
+  holder: 1 | 2;
+  note?: string[];
+  fan?: number;
+  fanU?: number;
+}
+
+/* patch روی منحنیِ افست — مستقل از پروفایل اصلی؛ مختصات در فضای پروفایل */
+export interface OffPatch {
+  a?: { z: number; r: number };
+  b?: { z: number; r: number };
+  c1?: { z: number; r: number };
+  c2?: { z: number; r: number };
+  via?: { z: number; r: number };
+  del?: boolean;
+}
+
+export interface EditBuf {
+  verts: EVert[];
+  lines: ELine[]; // به همان ترتیب اجرای برنامه؛ همواره vb==vaِ خطِ بعد (زنجیرهٔ بسته)
+  sketch: SketchSeg[]; // کپیِ کاریِ پروفایل (تأیید = انتقال به اسکچ اصلی)
+  off: Record<number, OffPatch>; // ویرایش مستقل منحنی‌های افست (کلید = id قطعهٔ پروفایل)
+  /** آفست کاری H2؛ تا زمان «تأیید» پیش‌نویس است و Params/فایل را تغییر نمی‌دهد. */
+  holder2: Holder2State;
+  /** نقطه Split کاری در ویرایش مسیر؛ تا زمان «تأیید» پیش‌نویس است. */
+  split?: SplitState;
+  /** انتخاب Segment جزئی از تاریخچهٔ اصلی است تا Undo/Redo آن را نیز بازیابی کند. */
+  selLines: number[];
+  activeLine: number | null;
+}
+
+export type ELineXY = ELine & { z1: number; x1: number; z2: number; x2: number };
+
+export function expandLines(verts: EVert[], lines: ELine[]): ELineXY[] {
+  const m = new Map<number, EVert>();
+  for (const v of verts) m.set(v.id, v);
+  return lines.map((l) => {
+    const a = m.get(l.va) ?? { z: 0, x: 0, id: -1 };
+    const b = m.get(l.vb) ?? { z: 0, x: 0, id: -1 };
+    return { ...l, z1: a.z, x1: a.x, z2: b.z, x2: b.x };
+  });
+}
+
+/**
+ * جابه‌جایی سبکِ تمام مسیرهای هلدر دوم در فضای ماشین.
+ *
+ * تغییر آفست هلدر یک تبدیل سراسری است؛ بنابراین فقط Segment کلیک‌شده جابه‌جا
+ * نمی‌شود و همهٔ رأس‌های H2 با هم حرکت می‌کنند. تعداد خط‌ها و شناسه‌ها مطلقاً
+ * دست‌نخورده می‌ماند. پله‌های مصنوعیِ اتصال H1/H2 نیز با حفظ جهت اصلی‌شان
+ * دوباره هم‌راستا می‌شوند تا هنگام Drag هیچ خط موربی ساخته نشود:
+ *   - پلهٔ افقی: X قطری دو سر برابر می‌ماند؛
+ *   - پلهٔ عمودی: Z دو سر برابر می‌ماند.
+ *
+ * dz در محور طولی ماشین و dv در محور شعاعی ماشین است (EVert.x قطری است، پس
+ * جابه‌جایی شعاعی با ضریب ۲ روی آن اعمال می‌شود).
+ */
+export function translateHolder2Edit(verts: EVert[], lines: ELine[], dz: number, dv: number): EVert[] {
+  if (Math.abs(dz) < 1e-12 && Math.abs(dv) < 1e-12) return verts;
+
+  const original = new Map(verts.map((v) => [v.id, v]));
+  const movedH2 = new Set<number>();
+  const touchedH1 = new Set<number>();
+  for (const line of lines) {
+    /* #bridgeها مختصات مصنوعی ماشین‌اند و holder=1 آن‌ها به معنی مسیر H1 نیست. */
+    if (line.key.startsWith("#bridge:")) continue;
+    const target = line.holder === 2 ? movedH2 : touchedH1;
+    target.add(line.va);
+    target.add(line.vb);
+  }
+  if (!movedH2.size) return verts;
+
+  /* رأس مرزیِ مشترک بین آخرین خط H1 و اولین خط H2 نباید روی هر دو محور لنگر
+     شود. این رأس آزاد می‌ماند تا خط افقی آخر، مؤلفهٔ Y را از H1 بگیرد و خط
+     عمودی متصل، مؤلفهٔ X را از H2؛ دقیقاً یک گوشهٔ قائم، بدون خط اضافه. */
+  const fixedH1 = new Set([...touchedH1].filter((id) => !movedH2.has(id)));
+  const fixedH2 = new Set([...movedH2].filter((id) => !touchedH1.has(id)));
+
+  const out = verts.map((v) =>
+    movedH2.has(v.id) ? { ...v, z: v.z + dz, x: v.x + 2 * dv } : { ...v }
+  );
+  const byId = new Map(out.map((v) => [v.id, v]));
+  /* علاوه بر #bridgeهای پس‌پردازنده، اتصال اولیه‌ای که خود مولد می‌سازد نیز
+     ELine عادی است (آخرین G0 افقی H1 + اولین G0 عمودی H2). پس قید محور روی
+     همهٔ خطوطی که پیش از Drag دقیقاً افقی/عمودی بوده‌اند اعمال می‌شود. */
+  const axis = lines
+    .map((line) => {
+      const a = original.get(line.va), b = original.get(line.vb);
+      if (!a || !b) return null;
+      if (Math.abs(a.x - b.x) < 1e-7) return { line, kind: "h" as const };
+      if (Math.abs(a.z - b.z) < 1e-7) return { line, kind: "v" as const };
+      return null;
+    })
+    .filter((item): item is { line: ELine; kind: "h" | "v" } => !!item);
+
+  /* حداکثر سه پله در هر پل وجود دارد. چند گذر کوچک و ثابت برای انتشار قید از
+     رأس H2 تا رأس‌های میانی کافی است و برخلاف بازتولید جی‌کد در هر pointermove
+     هزینه‌اش ناچیز و مستقل از پیچیدگی هندسهٔ قطعه است. */
+  for (let pass = 0; pass < 4; pass++) {
+    let changed = false;
+    for (const { line, kind } of axis) {
+      const a = byId.get(line.va), b = byId.get(line.vb);
+      const a0 = original.get(line.va), b0 = original.get(line.vb);
+      if (!a || !b || !a0 || !b0) continue;
+      const field: "x" | "z" = kind === "h" ? "x" : "z";
+      if (Math.abs(a[field] - b[field]) < 1e-9) continue;
+      const aAnchor = fixedH2.has(a.id) || fixedH1.has(a.id);
+      const bAnchor = fixedH2.has(b.id) || fixedH1.has(b.id);
+      if (aAnchor && !bAnchor) {
+        b[field] = a[field];
+        changed = true;
+      } else if (bAnchor && !aAnchor) {
+        a[field] = b[field];
+        changed = true;
+      } else if (!aAnchor && !bAnchor) {
+        const aChanged = Math.abs(a[field] - a0[field]) > 1e-9;
+        const bChanged = Math.abs(b[field] - b0[field]) > 1e-9;
+        if (aChanged && !bChanged) b[field] = a[field];
+        else if (bChanged && !aChanged) a[field] = b[field];
+        else b[field] = a[field];
+        changed = true;
+      }
+      /* دو رأس لنگر به عمد جابه‌جا نمی‌شوند؛ چنین حالتی فقط در دادهٔ قدیمیِ
+         بدون پل ممکن است و تغییر هندسهٔ واقعی H1 از ساخت خط مورب خطرناک‌تر است. */
+    }
+    if (!changed) break;
+  }
+  return out;
+}
+
+/* زنجیره‌سازی: سرِ هر خط = انتهای خطِ پیشین اگر «تقریباً» یکی بودند → رأسِ مشترک؛
+   وگرنه رأسِ تازه (شکافِ واقعی همان‌طور که در سیمکو هم خطِ وصل دیده می‌شود). */
+export function seedGcodeEdit(segs: Seg[], p: Params): Pick<EditBuf, "verts" | "lines"> {
+  const verts: EVert[] = [];
+  const lines: ELine[] = [];
+  const plan = planBridges(segs, p);
+  const bridgeAt = new Map(plan.bridges.map((b) => [b.atIndex, b]));
+  /* آیکن S باید دقیقاً روی نقطه آغاز واقعی G-code باشد، نه Home قدیمی.
+     با Reverse نیز شروع سگمنت اول عوض می‌شود و S خودکار به سر مقابل می‌رود. */
+  const initialStart=segs.length?execUV(segs[0],false,p):plan.home;
+  let current = { ...initialStart };
+  let nextLineId = 1;
+  const addV = (u: number, v: number) => { const id = verts.length; verts.push({ id, z: u, x: 2 * v }); return id; };
+  let lastV = addV(current.u, current.v);
+  const addLine = (to: { u: number; v: number }, meta: Omit<ELine, "id" | "va" | "vb">) => {
+    if (Math.hypot(to.u - current.u, to.v - current.v) < 1e-7) return;
+    const vb = addV(to.u, to.v);
+    lines.push({ ...meta, id: nextLineId++, va: lastV, vb });
+    lastV = vb;
+    current = { ...to };
+  };
+  const bridgeMeta = (baseKey: string, leg: number, move?: { motion: 0 | 1; feed: number }): Omit<ELine, "id" | "va" | "vb"> => ({
+    key: `#bridge:${baseKey}:${leg}`,
+    motion: move?.motion ?? 0,
+    feed: move?.motion === 1 ? move.feed : RAPID_RATE,
+    feedOvr: !!move,
+    opId: -1,
+    kind: "rapid",
+    holder: 1,
+  });
+  segs.forEach((sg, i) => {
+    const e1 = execUV(sg, false, p), e2 = execUV(sg, true, p);
+    const br = bridgeAt.get(i);
+    const baseKey = sg.ovrKey ?? `move:${i}`;
+    if (br) for (let j = 0; j < br.legs.length; j++) addLine(br.legs[j], bridgeMeta(baseKey, j, sg.bridgeMoves?.[j]));
+    if (!(br && br.absorbed)) addLine(e1, bridgeMeta(baseKey, 8, sg.bridgeMoves?.[8]));
+    addLine(e2, { key: sg.ovrKey ?? `#move:${i}`, motion: sg.motion, feed: sg.feed, feedOvr: sg.feedOvr, opId: sg.opId, kind: sg.kind, holder: sg.holder, note: sg.note, fan: sg.fan, fanU: sg.fanU });
+  });
+  return normalizeEditBuf(verts, lines);
+}
+
+/* نرمال‌سازیِ بافر بعد از هر تغییر (اعتبارسنجی خواستهٔ ۹):
+   - خطِ صفرطول حذف و رأسِ مضاعف ادغام می‌شود؛
+   - خط‌هایِ تکراریِ چسبیده یکی می‌شوند؛
+   - رأس‌های بی‌استفاده (یتیم) پاک می‌شوند تا «نقطهٔ اضافی» نماند. */
+export function normalizeEditBuf(verts: EVert[], lines: ELine[]): { verts: EVert[]; lines: ELine[]; dropped: number } {
+  const byId = new Map(verts.map((v) => [v.id, v]));
+  const kept: ELine[] = [];
+  let dropped = 0;
+  for (const original of lines) {
+    const a = byId.get(original.va), b = byId.get(original.vb);
+    if (!a || !b || Math.hypot(a.z - b.z, a.x - b.x) < 1e-7) { dropped++; continue; }
+    const prev = kept[kept.length - 1];
+    const line = prev ? { ...original, va: prev.vb } : { ...original };
+    const aa = byId.get(line.va);
+    if (!aa || Math.hypot(aa.z - b.z, aa.x - b.x) < 1e-7) { dropped++; continue; }
+    kept.push(line);
+  }
+  const order: number[] = [];
+  if (kept.length) { order.push(kept[0].va); for (const l of kept) order.push(l.vb); }
+  const remap = new Map<number, number>();
+  const vs: EVert[] = [];
+  for (const old of order) if (!remap.has(old)) { remap.set(old, vs.length); vs.push({ ...byId.get(old)!, id: vs.length }); }
+  const ls = kept.map((l, i) => ({ ...l, id: i + 1, va: remap.get(l.va)!, vb: remap.get(l.vb)! }));
+  dropped += verts.length - vs.length;
+  return { verts: vs, lines: ls, dropped };
+}
+
+/** حذف رأس‌های منفرد یا متوالی و اتصال مستقیم اولین همسایه معتبر به آخرین همسایه معتبر. */
+export function deleteEditVertices(verts: EVert[], lines: ELine[], ids: number[]) {
+  const remove = new Set(ids);
+  if (!remove.size) return normalizeEditBuf(verts, lines);
+  const keptVerts = verts.filter((v) => !remove.has(v.id));
+  const keptLines: ELine[] = [];
+  let pending: ELine | null = null;
+  for (const l of lines) {
+    const aGone = remove.has(l.va), bGone = remove.has(l.vb);
+    if (!aGone && !bGone) { keptLines.push(l); pending = null; }
+    else if (!aGone && bGone) pending = l;
+    else if (aGone && !bGone && pending) { keptLines.push({ ...pending, vb: l.vb }); pending = null; }
+  }
+  return normalizeEditBuf(keptVerts, keptLines);
+}
+
+/** حذف Segment با ادغام دو سر آن در مرکز هندسی، بدون شکستن زنجیره. */
+export function deleteEditLines(verts: EVert[], lines: ELine[], ids: number[]) {
+  const remove = new Set(ids);
+  const vs = verts.map((v) => ({ ...v }));
+  const vm = new Map(vs.map((v) => [v.id, v]));
+  const ls = lines.map((l) => ({ ...l }));
+  for (let i = 0; i < ls.length; i++) {
+    if (!remove.has(ls[i].id)) continue;
+    let j = i;
+    while (j + 1 < ls.length && remove.has(ls[j + 1].id)) j++;
+    const first = ls[i], last = ls[j], a = vm.get(first.va), b = vm.get(last.vb);
+    if (a && b) {
+      const mz = (a.z + b.z) / 2, mx = (a.x + b.x) / 2;
+      a.z = mz; a.x = mx; b.z = mz; b.x = mx;
+      if (i > 0) ls[i - 1].vb = a.id;
+      if (j + 1 < ls.length) ls[j + 1].va = a.id;
+    }
+    ls.splice(i, j - i + 1); i--;
+  }
+  return normalizeEditBuf(vs, ls);
+}
+
+/** درج رأس روی Segment و تقسیم آن به دو Segment با حفظ ترتیب و مشخصات حرکت. */
+export function insertEditVertex(verts: EVert[], lines: ELine[], lineId: number, z: number, x: number) {
+  const i = lines.findIndex((l) => l.id === lineId);
+  if (i < 0) return normalizeEditBuf(verts, lines);
+  const l = lines[i], a = verts.find((v) => v.id === l.va), b = verts.find((v) => v.id === l.vb);
+  if (!a || !b || Math.hypot(z - a.z, x - a.x) < 1e-6 || Math.hypot(z - b.z, x - b.x) < 1e-6) return normalizeEditBuf(verts, lines);
+  const id = Math.max(-1, ...verts.map((v) => v.id)) + 1;
+  const nextVerts = [...verts, { id, z, x }];
+  const nextLines = [...lines.slice(0, i), { ...l, vb: id }, { ...l, id: Math.max(0, ...lines.map((q) => q.id)) + 1, va: id }, ...lines.slice(i + 1)];
+  return normalizeEditBuf(nextVerts, nextLines);
+}
+
+/* patches مطلق روی برنامهٔ پایه + حذف‌ها؛ کلیدهای پل (شروع #) نادیده (مجدداً تزریق می‌شوند) */
+export function deriveGcodeOvr(verts: EVert[], lines: ELine[], baseSegs: Seg[], prev: GcodeOvrMap, p: Params): GcodeOvrMap {
+  const exp = expandLines(verts, lines);
+  const next: GcodeOvrMap = { ...prev };
+  const byKey = new Map<string, Seg>();
+  for (const sg of baseSegs) if (sg.ovrKey) byKey.set(sg.ovrKey, sg);
+  const groups = new Map<string, ELineXY[]>();
+  const bridgeEdits = new Map<string, Record<number, { motion: 0 | 1; feed: number }>>();
+  for (const l of exp) {
+    const bridge = /^#bridge:(.+):(\d+)$/.exec(l.key);
+    if (bridge) {
+      /* پله‌های مصنوعی ذاتاً G0 هستند؛ فقط تبدیل آن‌ها به G1 نیازمند override است. */
+      if (l.motion === 1) {
+        const baseKey = bridge[1];
+        const leg = Number(bridge[2]);
+        const edits = bridgeEdits.get(baseKey) ?? {};
+        edits[leg] = { motion: 1, feed: l.feed };
+        bridgeEdits.set(baseKey, edits);
+      }
+    } else if (!l.key.startsWith("#")) {
+      const g = groups.get(l.key); if (g) g.push(l); else groups.set(l.key, [l]);
+    }
+  }
+  const sx = p.gcodeShiftX ?? 0;
+  const sy = p.gcodeShiftY ?? 0;
+  const toWorld = (z: number, x: number, sg: Seg) => {
+    const u = z - (sg.fanU ?? 0) - sx, v = x / 2 - (sg.fan ?? 0) - sy;
+    return sg.holder === 2 ? { z: u - p.holder2.xOff, x: 2 * (v + p.holder2.yOff) } : { z: u, x: 2 * v };
+  };
+  for (const [key, group] of groups) {
+    const b = byKey.get(key); if (!b) continue;
+    const s0 = toWorld(group[0].z1, group[0].x1, b);
+    const e0 = toWorld(group[group.length - 1].z2, group[group.length - 1].x2, b);
+    const via = group.slice(0, -1).map((l) => toWorld(l.z2, l.x2, b));
+    const o: GcodeOvr = {};
+    const bridgeMoves = bridgeEdits.get(key);
+    if (bridgeMoves && Object.keys(bridgeMoves).length) o.bridgeMoves = bridgeMoves;
+    if (Math.hypot(b.z1 - s0.z, b.x1 - s0.x) > 1e-8) o.s = s0;
+    if (Math.hypot(b.z2 - e0.z, b.x2 - e0.x) > 1e-8) o.e = e0;
+    if (via.length) o.via = via;
+    const moves = group.map((l) => ({ motion: l.motion, feed: l.motion === 0 ? RAPID_RATE : l.feed }));
+    if (moves.some((m) => m.motion !== b.motion || (m.motion === 1 && Math.abs(m.feed - b.feed) > 1e-8))) o.moves = moves;
+    if (o.s || o.e || o.via || o.moves || o.bridgeMoves) next[key] = o; else delete next[key];
+  }
+  for (const sg of baseSegs) if (sg.ovrKey && !groups.has(sg.ovrKey)) next[sg.ovrKey] = { del: true };
+  return next;
+}

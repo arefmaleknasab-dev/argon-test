@@ -1,0 +1,6 @@
+{
+  "name": "خراط‌کد — شبیه‌ساز و تولید جی‌کد خراطی CNC",
+  "description": "نرم‌افزار تخصصی طراحی پروفیل، شبیه‌سازی دو و سه‌بعدی، جبران شعاع ابزار و تولید جی‌کد خراطی CNC",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

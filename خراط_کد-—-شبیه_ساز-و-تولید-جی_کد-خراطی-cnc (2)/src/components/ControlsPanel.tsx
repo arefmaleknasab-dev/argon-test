@@ -1,0 +1,1855 @@
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import type { BlankShape, Holder2State, HolderMachinePoint, Op, OpToolComp, OpType, Params, PPoint, Preset, Sample, ToolHand, ToolSpec, ToolType } from "../lib/lathe";
+import { ALL_OP_TYPES, BLANK_SHAPES, HAND_INFO, HOLDER2_ROT, INNER_OPS, INSERT_ANGLE, MAX_INNER_DISTANCE, MIN_HOLDER2_OFFSET, MIN_INNER_DISTANCE, NOSE_RADII, OP_INFO, OUTER_OPS, PRESETS, ROUGH_MODES, STRATEGIES, continuousPathOffset, findZones, holder2OffsetFromCoordinates, innerOffsetLeftSide, makeOps, normalOffset, outerFirstOps, outerFirstTypes, rotationalEnvelope, sampleOrderedProfile, thumbPath, toolProfile } from "../lib/lathe";
+import { DEFAULT_THEME_COLORS, opColorFromTheme, rgbaCss, shadeHex, type ThemeColors } from "../lib/theme";
+import { cn } from "../utils/cn";
+import { IconBowl, IconCheck, IconCurve, IconEye, IconEyeOff, IconLayers, IconPlus, IconSpindle, IconTool, IconTrash } from "./icons";
+import { ToolCompDialog } from "./ToolCompDialog";
+
+const COLLAPSIBLE_SECTION_TITLES = [
+  "پیش‌تنظیم‌های طرح",
+  "استراتژی تراش",
+  "کاسه و هلدر دوم",
+  "ابزار تراش",
+  "قطعه خام",
+  "پارامترهای برداشت",
+] as const;
+const SECTION_COLLAPSE_COMMAND = "xarat-code:section-collapse-command";
+const SECTION_COLLAPSE_CHANGED = "xarat-code:section-collapse-changed";
+
+interface Props {
+  params: Params;
+  /** مقدار پیش‌نویس در حالت ویرایش مسیر؛ فقط نمایش زنده تا زمان تأیید. */
+  holder2Draft: Holder2State | null;
+  onHolder2: (value: Holder2State) => void;
+  onParams: (patch: Partial<Params>) => void;
+  points: PPoint[];
+  /** مسیر توپولوژیک برای نمایش شکل (نقاط عمودی هم حفظ می‌شوند). */
+  outerDisplayPoints?: PPoint[];
+  innerPoints: PPoint[];
+  splitInfo: { outerDir: 1 | -1; innerDir: 1 | -1; at: { z: number; r: number } } | null;
+  onAutoSplit: () => void;
+
+  activePreset: string | null;
+  onApplyPreset: (p: Preset) => void;
+
+  onStrategy: (id: string, name: string, types: OpType[]) => void;
+  isolatedOpId: number | null;
+  onIsolate: (id: number | null) => void;
+  onNotify: (msg: string) => void;
+  themeColors?: ThemeColors;
+}
+
+function ControlsPanel({
+  params,
+  holder2Draft,
+  onHolder2,
+  onParams,
+  points,
+  outerDisplayPoints,
+  innerPoints,
+  activePreset,
+  onApplyPreset,
+  onStrategy,
+  isolatedOpId,
+  onIsolate,
+  onNotify,
+  themeColors = DEFAULT_THEME_COLORS,
+}: Props) {
+  /* امضای استراتژی فعلی برای تشخیص پیش‌تنظیم فعال (با قاعدهٔ پیش‌فرض: بیرونی‌ها اول) */
+  const sig = outerFirstOps(params.ops.filter((o) => o.on)).map((o) => o.type).join(",");
+  const [pendingStrategy, setPendingStrategy] = useState<(typeof STRATEGIES)[number] | null>(null);
+  const sectionsAreCollapsed = () => {
+    const saved = loadCollapsedSections();
+    return COLLAPSIBLE_SECTION_TITLES.every((title) => !!saved[title]);
+  };
+  const [allSectionsCollapsed, setAllSectionsCollapsed] = useState(sectionsAreCollapsed);
+  useEffect(() => {
+    const sync = () => setAllSectionsCollapsed(sectionsAreCollapsed());
+    window.addEventListener(SECTION_COLLAPSE_CHANGED, sync);
+    return () => window.removeEventListener(SECTION_COLLAPSE_CHANGED, sync);
+  }, []);
+  const toggleAllSections = () => {
+    const next = !allSectionsCollapsed;
+    try {
+      const saved = loadCollapsedSections();
+      for (const title of COLLAPSIBLE_SECTION_TITLES) {
+        if (next) saved[title] = true;
+        else delete saved[title];
+      }
+      localStorage.setItem(COLLAPSED_SECTIONS_KEY, JSON.stringify(saved));
+    } catch {
+      /* رابط همچنان با رویداد همگام می‌شود، حتی اگر ذخیره محلی در دسترس نباشد. */
+    }
+    setAllSectionsCollapsed(next);
+    window.dispatchEvent(new CustomEvent<boolean>(SECTION_COLLAPSE_COMMAND, { detail: next }));
+  };
+
+  /* درگ‌ودراپ برای جابه‌جایی عملیات‌ها (کنار فلش‌ها) */
+  const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const [dropEdge, setDropEdge] = useState<number | null>(null); // k = درج «قبل» از ردیف k (یا انتها اگر k=length)
+  const gripRef = useRef<number | null>(null);
+
+  const setOps = (ops: Op[]) => onParams({ ops });
+  const toggleHolder = (id: number) =>
+    setOps(params.ops.map((o) => (o.id === id ? { ...o, holder: o.holder === 2 ? 1 : 2 } : o)));
+  /* انتخاب سریع نوع عملیات: فقط خارج / فقط داخل / هردو */
+  const setOpGroup = (mode: "outer" | "inner" | "both") =>
+    setOps(
+      params.ops.map((o) => ({
+        ...o,
+        on: mode === "both" ? true : mode === "outer" ? OUTER_OPS.includes(o.type) : INNER_OPS.includes(o.type),
+      }))
+    );
+  const outerActive = params.ops.some((o) => o.on && OUTER_OPS.includes(o.type));
+  const innerActive = params.ops.some((o) => o.on && INNER_OPS.includes(o.type));
+  const shownHolder2 = holder2Draft ?? params.holder2;
+  const holder2IsDraft = !!holder2Draft &&
+    (holder2Draft.xOff !== params.holder2.xOff || holder2Draft.yOff !== params.holder2.yOff);
+  const moveOp = (i: number, dir: -1 | 1) => {
+    const j = i + dir;
+    if (j < 0 || j >= params.ops.length) return;
+    const ops = [...params.ops];
+    [ops[i], ops[j]] = [ops[j], ops[i]];
+    setOps(ops);
+  };
+  const toggleOp = (id: number) => setOps(params.ops.map((o) => (o.id === id ? { ...o, on: !o.on } : o)));
+  const toggleOpDirection = (id: number) => setOps(params.ops.map((o) => (o.id === id ? { ...o, reverse: !o.reverse } : o)));
+  const removeOp = (id: number) => setOps(params.ops.filter((o) => o.id !== id));
+  const addOp = (type: OpType) => {
+    const op = makeOps([type])[0];
+    /* ترتیب مرجع دقیقاً همان ترتیب منوی «افزودن عملیات» است. با افزودن هر مورد،
+       زنجیره به‌صورت پایدار بر همین اساس مرتب می‌شود تا عملیات تازه فوراً در
+       ردیف اصلی خودش قرار بگیرد؛ نمونه‌های تکراری ترتیب نسبی خود را حفظ می‌کنند. */
+    const rank = new Map(ALL_OP_TYPES.map((item, index) => [item, index]));
+    const ops = [...params.ops, op]
+      .map((item, index) => ({ item, index }))
+      .sort((a, b) => (rank.get(a.item.type) ?? ALL_OP_TYPES.length) - (rank.get(b.item.type) ?? ALL_OP_TYPES.length) || a.index - b.index)
+      .map(({ item }) => item);
+    setOps(ops);
+  };
+  /* درگ‌ودراپ: برداشتن از دسته، رها روی لبهٔ رویی/زیری هر ردیف */
+  const reorderOps = (from: number, ins: number) => {
+    if (from === ins || from + 1 === ins) return;
+    const ops = [...params.ops];
+    const [m] = ops.splice(from, 1);
+    ops.splice(ins > from ? ins - 1 : ins, 0, m);
+    setOps(ops);
+  };
+  const endDrag = () => {
+    gripRef.current = null;
+    setDragFrom(null);
+    setDropEdge(null);
+  };
+
+  const onTool = (patch: Partial<ToolSpec>) => onParams({ tool: { ...params.tool, ...patch } });
+
+  /* نمونه‌های پروفایل و تقسیم خودکار نواحی (نقطهٔ شروع برای مرزسازی دستی) */
+  const { autoZones } = useMemo(() => {
+    const blankR = params.blankD / 2;
+    const srcPts = outerDisplayPoints && outerDisplayPoints.length >= 2 ? outerDisplayPoints : points;
+    const samples = sampleOrderedProfile(srcPts, blankR);
+    const off: Sample[] = normalOffset(samples, params.offsetDist, true).map((s) => ({ z: s.z, r: Math.min(blankR, s.r) }));
+    return { zoneSamples: off, autoZones: findZones(off) };
+  }, [outerDisplayPoints, points, params.blankD, params.offsetDist]);
+  /* برای تصویر تنظیم نواحی باید ترتیب واقعی Segmentها حفظ شود. sampleProfile
+     پوشش خشن را برحسب Z مرتب می‌کند و روی پروفایل‌های برگشتی شکل را می‌شکند. */
+  const innerZoneSamples = useMemo(() => {
+    if (!params.split.enabled || innerPoints.length < 2) return [];
+    let s = sampleOrderedProfile(innerPoints, params.blankD / 2);
+    if (s.length >= 2) {
+      const dStart = Math.hypot(s[0].z - params.split.z, s[0].r - params.split.r);
+      const dEnd = Math.hypot(
+        s[s.length - 1].z - params.split.z,
+        s[s.length - 1].r - params.split.r
+      );
+      if (dEnd + 1e-6 < dStart) s = [...s].reverse();
+    }
+    return s;
+  }, [innerPoints, params.blankD, params.split.enabled, params.split.z, params.split.r]);
+  const outerDisplaySamples = useMemo(() => {
+    const displayPoints = outerDisplayPoints && outerDisplayPoints.length >= 2 ? outerDisplayPoints : points;
+    if (displayPoints.length < 2) return [];
+    let s = sampleOrderedProfile(displayPoints, params.blankD / 2);
+    if (s.length >= 2 && s[s.length - 1].z < s[0].z - 1e-6) {
+      s = [...s].reverse();
+    }
+    return s;
+  }, [outerDisplayPoints, points, params.blankD]);
+  const outerOffsetSamples = useMemo(() => {
+    if (outerDisplaySamples.length < 2) return [];
+    return normalOffset(outerDisplaySamples, Math.max(0, params.offsetDist), true);
+  }, [outerDisplaySamples, params.offsetDist]);
+  const innerOffsetSamples = useMemo(() => {
+    if (innerZoneSamples.length < 2) return [];
+    return continuousPathOffset(
+      innerZoneSamples,
+      Math.max(0, params.innerOffsetDist),
+      innerOffsetLeftSide(innerZoneSamples)
+    ).reverse();
+  }, [innerZoneSamples, params.innerOffsetDist]);
+
+  const [toolCompOpId, setToolCompOpId] = useState<number | null>(null);
+  const activeToolCompOp = useMemo(
+    () => (toolCompOpId != null ? params.ops.find((o) => o.id === toolCompOpId) ?? null : null),
+    [params.ops, toolCompOpId]
+  );
+  const saveOpToolComp = (opId: number, toolComp: OpToolComp) => {
+    setOps(params.ops.map((o) => (o.id === opId ? { ...o, toolComp } : o)));
+    const info = params.ops.find((o) => o.id === opId);
+    onNotify(
+      toolComp.enabled && toolComp.mode !== "G40"
+        ? `جبران شعاع (${toolComp.machine === "mill" ? "مرکز ابزار" : "نوک ابزار"}) روی «${info ? OP_INFO[info.type].name : "عملیات"}» اعمال شد`
+        : `جبران شعاع برای «${info ? OP_INFO[info.type].name : "عملیات"}» غیرفعال شد`
+    );
+  };
+  const saveAllOpsToolComp = (toolComp: OpToolComp, holder: 1 | 2) => {
+    setOps(
+      params.ops.map((o) =>
+        o.holder === holder ? { ...o, toolComp: { ...toolComp } } : o
+      )
+    );
+    onNotify(
+      toolComp.enabled && toolComp.mode !== "G40"
+        ? `جبران شعاع (${toolComp.machine === "mill" ? "مرکز ابزار" : "نوک ابزار"}) روی همه عملیات‌های H${holder} اعمال شد`
+        : `جبران شعاع روی همه عملیات‌های H${holder} غیرفعال شد`
+    );
+  };
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-y-auto pl-0.5">
+      <div className="sticky top-0 z-20 flex items-center justify-between rounded-lg border border-edge bg-panel/95 px-2.5 py-2 shadow-lg shadow-black/25 backdrop-blur-sm">
+        <span className="text-[10.5px] font-bold text-mute">بخش‌های تنظیمات</span>
+        <button
+          type="button"
+          onClick={toggleAllSections}
+          className="flex items-center gap-1.5 rounded-md border border-edge bg-panel2 px-2 py-1 text-[10.5px] font-bold text-ink transition-colors hover:border-brass/50 hover:text-brass2"
+          title={allSectionsCollapsed ? "باز کردن همه بخش‌های تنظیمات" : "جمع کردن همه بخش‌های تنظیمات"}
+        >
+          <svg viewBox="0 0 14 14" className={cn("h-3 w-3 transition-transform", allSectionsCollapsed && "rotate-180")} fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M2 5l5-3 5 3M2 10l5-3 5 3" />
+          </svg>
+          {allSectionsCollapsed ? "باز کردن همه" : "جمع کردن همه"}
+        </button>
+      </div>
+
+      {/* پیش‌تنظیم‌های طرح */}
+      <Section title="پیش‌تنظیم‌های طرح" icon={<IconLayers className="h-3.5 w-3.5 text-brass" />}>
+        <div className="grid grid-cols-3 gap-1.5">
+          {PRESETS.map((p) => (
+            <button
+              key={p.id}
+              onClick={() => onApplyPreset(p)}
+              className={cn(
+                "group rounded-md border p-1.5 text-center transition-all hover:-translate-y-0.5",
+                activePreset === p.id
+                  ? "border-brass/70 bg-brass/10 shadow-[0_0_14px_rgba(227,169,78,0.15)]"
+                  : "border-edge bg-panel2 hover:border-edge2"
+              )}
+              title={p.empty ? "بوم خالی ۱۰۰ × ۱۰۰ میلی‌متر با مقطع مربعی" : `خام ⌀${p.blankD} × ${p.blankL}`}
+            >
+              <svg viewBox="0 0 100 34" className="h-8 w-full">
+                <line x1="0" y1="17" x2="100" y2="17" stroke="rgba(var(--rgb-brass), 0.35)" strokeWidth="0.8" strokeDasharray="3 2" />
+                <path
+                  d={thumbPath(p, 100, 34)}
+                  fill={p.empty ? "rgba(var(--rgb-brass), 0.06)" : "rgba(var(--rgb-brass), 0.24)"}
+                  stroke="var(--color-brass)"
+                  strokeWidth="1.1"
+                  strokeDasharray={p.empty ? "4 3" : undefined}
+                  fillRule="evenodd"
+                />
+              </svg>
+              <div className={cn("mt-1 text-[10.5px] font-semibold", activePreset === p.id ? "text-brass2" : "text-mute group-hover:text-ink")}>
+                {p.name}
+              </div>
+            </button>
+          ))}
+        </div>
+      </Section>
+
+      {/* استراتژی تراش */}
+      <Section title="استراتژی تراش" icon={<IconCurve className="h-3.5 w-3.5 text-brass" />}>
+        <div className="mb-2 grid grid-cols-2 gap-1.5">
+          {STRATEGIES.map((st) => {
+            const on = sig === outerFirstTypes(st.types).join(",");
+            return (
+              <button
+                key={st.id}
+                onClick={() => setPendingStrategy(st)}
+                className={cn(
+                  "rounded-md border px-1 py-1.5 text-[10.5px] font-bold transition-all hover:-translate-y-0.5",
+                  on ? "border-teal/70 bg-teal/10 text-teal" : "border-edge bg-panel2 text-mute hover:border-edge2 hover:text-ink"
+                )}
+              >
+                {st.name}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="space-y-1">
+          {params.ops.map((op, i) => {
+            const info = OP_INFO[op.type];
+            const isolated = isolatedOpId === op.id;
+            const dragging = dragFrom === i;
+            return (
+              <div
+                key={op.id}
+                draggable
+                onDragStart={(e) => {
+                  if (gripRef.current !== i) {
+                    e.preventDefault();
+                    return;
+                  }
+                  e.dataTransfer.effectAllowed = "move";
+                  try {
+                    e.dataTransfer.setData("text/plain", String(op.id));
+                  } catch {
+                    /* ignore */
+                  }
+                  setDragFrom(i);
+                }}
+                onDragOver={(e) => {
+                  if (dragFrom == null) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  const r = e.currentTarget.getBoundingClientRect();
+                  setDropEdge(e.clientY < r.top + r.height / 2 ? i : i + 1);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (dragFrom != null && dropEdge != null) reorderOps(dragFrom, dropEdge);
+                  endDrag();
+                }}
+                onDragEnd={endDrag}
+                title={`${info.name} — ${info.desc}`}
+                className={cn(
+                  "group relative flex items-center gap-1.5 rounded-md border px-1.5 py-1 transition-all",
+                  op.on ? "border-edge bg-panel2" : "border-edge/60 bg-panel opacity-50",
+                  isolated && "border-teal/70 bg-teal/10 shadow-[0_0_12px_rgba(69,179,148,0.18)]",
+                  dragging && "opacity-40"
+                )}
+              >
+                {dragFrom != null && dropEdge === i && (
+                  <span className="pointer-events-none absolute -top-[3px] right-0 left-0 h-[2px] rounded-full bg-teal shadow-[0_0_6px_rgba(69,179,148,0.9)]" />
+                )}
+                {dragFrom != null && dropEdge === i + 1 && i === params.ops.length - 1 && (
+                  <span className="pointer-events-none absolute -bottom-[3px] right-0 left-0 h-[2px] rounded-full bg-teal shadow-[0_0_6px_rgba(69,179,148,0.9)]" />
+                )}
+                <button
+                  type="button"
+                  onPointerDown={() => {
+                    gripRef.current = i;
+                  }}
+                  onPointerUp={() => {
+                    if (dragFrom == null) gripRef.current = null;
+                  }}
+                  title="جابه‌جایی: ردیف را از اینجا بکشید"
+                  className="grid h-4 w-2.5 shrink-0 cursor-grab touch-none place-items-center rounded text-dim/50 transition-colors hover:text-brass active:cursor-grabbing"
+                >
+                  <svg viewBox="0 0 4 12" className="h-3 w-1 fill-current">
+                    <circle cx="1" cy="1" r="1" /><circle cx="3" cy="1" r="1" />
+                    <circle cx="1" cy="5" r="1" /><circle cx="3" cy="5" r="1" />
+                    <circle cx="1" cy="9" r="1" /><circle cx="3" cy="9" r="1" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => onIsolate(isolated ? null : op.id)}
+                  disabled={!op.on}
+                  title={isolated ? "خروج از نمای ایزوله" : "مشاهدهٔ ایزولهٔ مسیر این عملیات در بوم"}
+                  className={cn(
+                    "grid h-6 w-6 shrink-0 place-items-center rounded border transition-all",
+                    isolated
+                      ? "border-teal/60 bg-teal/15 text-teal"
+                      : "border-transparent text-dim hover:border-edge2 hover:text-teal",
+                    !op.on && "cursor-not-allowed opacity-30 hover:border-transparent hover:text-dim"
+                  )}
+                >
+                  {isolated ? <IconEyeOff className="h-3.5 w-3.5" /> : <IconEye className="h-3.5 w-3.5" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => toggleOpDirection(op.id)}
+                  title={op.reverse ? "بازگرداندن جهت شروع پیش‌فرض" : "معکوس کردن جهت شروع عملیات"}
+                  className={cn("grid h-6 w-6 shrink-0 place-items-center rounded border transition-all",op.reverse?"border-copper/60 bg-copper/15 text-copper":"border-edge text-dim hover:border-edge2 hover:text-ink")}
+                >
+                  <svg viewBox="0 0 450 469" aria-hidden="true" className={cn("h-[18px] w-[18px] transition-transform",op.reverse&&"scale-x-[-1]")}>
+                    <path d="M136 76 H310 C344 76 372 102 372 137 C372 172 347 202 312 202 H142 C108 202 78 229 78 264 C78 299 105 330 141 330 H254" fill="none" stroke="currentColor" strokeWidth="32" strokeLinecap="round" strokeLinejoin="round"/>
+                    <path d="M253 267 L360 330 L253 391 Z" fill="currentColor"/>
+                  </svg>
+                </button>
+                <button
+                  onClick={() => toggleHolder(op.id)}
+                  title={op.holder === 2 ? "هلدر ۲ — داخل‌تراش — کلیک برای تغییر" : "هلدر ۱ — اصلی — کلیک برای تغییر"}
+                  style={
+                    op.holder === 2
+                      ? {
+                          borderColor: rgbaCss(themeColors.opInnerRough, 0.6),
+                          backgroundColor: rgbaCss(themeColors.opInnerRough, 0.15),
+                          color: themeColors.opInnerRough,
+                        }
+                      : undefined
+                  }
+                  className={cn(
+                    "grid h-6 w-7 shrink-0 place-items-center rounded border font-mono text-[9px] font-bold transition-all",
+                    op.holder !== 2 && "border-edge text-dim hover:border-edge2 hover:text-ink"
+                  )}
+                >
+                  H{op.holder}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setToolCompOpId(op.id)}
+                  title={
+                    op.toolComp?.enabled && op.toolComp.mode !== "G40"
+                      ? `جبران شعاع فعال (${op.toolComp.machine === "mill" ? "مرکز ابزار" : "نوک ابزار"} · R=${op.toolComp.radius}mm) — کلیک برای تنظیم ابزار و جبران شعاع`
+                      : "تعیین ابزار و فعال‌سازی جبران شعاع (بر اساس مختصات X و Y)"
+                  }
+                  className={cn(
+                    "flex h-6 shrink-0 items-center gap-1 rounded border px-1.5 text-[9px] font-bold transition-all",
+                    op.toolComp?.enabled && op.toolComp.mode !== "G40"
+                      ? "border-teal bg-teal/20 text-teal shadow-[0_0_8px_rgba(69,179,148,0.28)]"
+                      : "border-edge text-dim hover:border-teal/60 hover:text-teal"
+                  )}
+                >
+                  <IconTool className="h-3 w-3 shrink-0" />
+                  <span>
+                    {op.toolComp?.enabled && op.toolComp.mode !== "G40"
+                      ? `${op.toolComp.machine === "mill" ? "مرکز" : "نوک"} R${op.toolComp.radius}`
+                      : "جبران"}
+                  </span>
+                </button>
+                <button onClick={() => toggleOp(op.id)} className="shrink-0" title={op.on ? "غیرفعال کردن" : "فعال کردن"}>
+                  <span
+                    className={cn(
+                      "block h-4 w-7 rounded-full border p-0.5 transition-colors",
+                      op.on ? "border-brass/60 bg-brass/25" : "border-edge2 bg-bg"
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        "block h-2.5 w-2.5 rounded-full transition-transform",
+                        op.on ? "translate-x-0 bg-brass2" : "-translate-x-3 bg-dim"
+                      )}
+                    />
+                  </span>
+                </button>
+                <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ background: opColorFromTheme(themeColors, op.type) }} />
+                <div className="min-w-0 flex-1 leading-tight">
+                  <div className="truncate text-[11px] font-bold text-ink/90">{info.name}</div>
+                  <div className="truncate text-[9.5px] text-dim">
+                    {op.toolComp?.enabled && op.toolComp.mode !== "G40"
+                      ? `جبران ${op.toolComp.machine === "mill" ? "مرکز ابزار" : "نوک ابزار"} (${op.toolComp.shape === "flat" ? `تخت W=${op.toolComp.width}` : `R=${op.toolComp.radius}mm`})`
+                      : info.desc}
+                  </div>
+                </div>
+                <div className="flex shrink-0 items-center gap-0.5">
+                  <div className="flex flex-col gap-px">
+                    <MiniBtn tight disabled={i === 0} onClick={() => moveOp(i, -1)} title="جلوتر">
+                      <path d="M8 10 4 6l-4 4" transform="translate(4 1)" />
+                    </MiniBtn>
+                    <MiniBtn tight disabled={i === params.ops.length - 1} onClick={() => moveOp(i, 1)} title="عقب‌تر">
+                      <path d="M0 4 4 8l4-4" transform="translate(4 1)" />
+                    </MiniBtn>
+                  </div>
+                  <MiniBtn danger onClick={() => removeOp(op.id)} title="حذف عملیات">
+                    <IconTrash className="h-3 w-3" />
+                  </MiniBtn>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <p className="mt-1.5 flex items-center gap-1.5 rounded-md bg-bg/50 px-2 py-1 text-[9.5px] text-dim">
+          <IconEye className="h-3 w-3 shrink-0 text-teal" />
+          جابه‌جایی: ردیف را از دستهٔ نقطه‌ای بکشید یا با فلش‌ها — چشم: نمایش ایزولهٔ مسیر
+        </p>
+
+        {/* افزودن عملیات */}
+        <div className="relative mt-1.5">
+          <IconPlus className="pointer-events-none absolute top-1/2 right-2 h-3.5 w-3.5 -translate-y-1/2 text-mute" />
+          <select
+            className="field-input appearance-none pr-7 text-[11.5px]"
+            value=""
+            onChange={(e) => {
+              if (e.target.value) addOp(e.target.value as OpType);
+              e.target.value = "";
+            }}
+          >
+            <option value="" disabled>
+              افزودن عملیات به زنجیره…
+            </option>
+            {ALL_OP_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {OP_INFO[t].name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+      </Section>
+
+      {/* کاسه: نقطه Split + هلدر دوم */}
+      <Section title="کاسه و هلدر دوم" icon={<IconBowl className="h-3.5 w-3.5 text-brass" />}>
+        <Toggle
+          label="حالت کاسه (نقطه Split)"
+          on={params.split.enabled}
+          onChange={(v) => onParams({ split: { ...params.split, enabled: v } })}
+        />
+        {params.split.enabled ? (
+          <div className="anim-in mt-2 space-y-2">
+            {/* نوع عملیات */}
+            <div>
+              <span className="mb-1 block text-[10.5px] font-semibold text-mute">نوع عملیات</span>
+              <div className="grid grid-cols-3 gap-1.5">
+                <button
+                  onClick={() => setOpGroup("outer")}
+                  className={cn(
+                    "rounded-md border px-1 py-1.5 text-[10px] font-bold transition-all",
+                    outerActive && !innerActive ? "border-brass/70 bg-brass/10 text-brass2" : "border-edge bg-panel2 text-mute hover:text-ink"
+                  )}
+                >
+                  خارج‌تراشی
+                </button>
+                <button
+                  onClick={() => setOpGroup("inner")}
+                  className={cn(
+                    "rounded-md border px-1 py-1.5 text-[10px] font-bold transition-all",
+                    innerActive && !outerActive ? "" : "border-edge bg-panel2 text-mute hover:text-ink"
+                  )}
+                  style={innerActive && !outerActive ? { borderColor: rgbaCss(themeColors.opInnerRough, 0.7), backgroundColor: rgbaCss(themeColors.opInnerRough, 0.12), color: themeColors.opInnerRough } : undefined}
+                >
+                  داخل‌تراشی
+                </button>
+                <button
+                  onClick={() => setOpGroup("both")}
+                  className={cn(
+                    "rounded-md border px-1 py-1.5 text-[10px] font-bold transition-all",
+                    outerActive && innerActive ? "border-teal/70 bg-teal/10 text-teal" : "border-edge bg-panel2 text-mute hover:text-ink"
+                  )}
+                >
+                  هردو
+                </button>
+              </div>
+            </div>
+
+          </div>
+        ) : (
+          <p className="mt-1.5 rounded-md border border-dashed border-edge px-2 py-1.5 text-[10px] leading-5 text-dim">
+            با فعال‌سازی، پروفیل در نقطه Split به دو شاخه داخل/خارج تقسیم می‌شود. نمونه آماده: <span className="font-bold text-brass2">«کاسه (داخل+خارج)»</span> از پیش‌تنظیم‌ها.
+          </p>
+        )}
+
+        {/* تنظیمات هلدر دوم مستقل از استراتژی و Split همیشه در دسترس است. */}
+        <div className="mt-2 rounded-lg border p-2" style={{ borderColor: rgbaCss(themeColors.opInnerRough, 0.35), backgroundColor: rgbaCss(themeColors.opInnerRough, 0.06) }}>
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[11px] font-bold" style={{ color: themeColors.opInnerRough }}>هلدر دوم (داخل‌تراش)</span>
+            <div className="flex items-center gap-1">
+              {holder2IsDraft && (
+                <span className="rounded-full border border-teal/50 bg-teal/10 px-2 py-0.5 text-[8.5px] font-bold text-teal">
+                  زنده · پیش‌نویس
+                </span>
+              )}
+              <span className="rounded-full border border-edge px-2 py-0.5 font-mono text-[9px] font-bold text-mute" dir="ltr">
+                ROT {HOLDER2_ROT}°
+              </span>
+            </div>
+          </div>
+          <span className="mb-1 block text-[9.5px] font-bold text-mute">تنظیم مستقیم افست</span>
+          <div className="grid grid-cols-2 gap-2">
+            <Num label="X Offset (+X)" unit="mm" value={shownHolder2.xOff} min={MIN_HOLDER2_OFFSET} step={0.5} onChange={(v) => onHolder2({ ...shownHolder2, xOff: Math.max(MIN_HOLDER2_OFFSET, v) })} />
+            <Num label="Y Offset (−Y)" unit="mm" value={shownHolder2.yOff} min={MIN_HOLDER2_OFFSET} step={0.5} onChange={(v) => onHolder2({ ...shownHolder2, yOff: Math.max(MIN_HOLDER2_OFFSET, v) })} />
+          </div>
+          <Holder2CoordinateCalibration current={shownHolder2} onApply={onHolder2} />
+        </div>
+      </Section>
+
+      {/* ابزار تراش */}
+      <Section title="ابزار تراش" icon={<IconTool className="h-3.5 w-3.5 text-brass" />}>
+        <ToolPreview tool={params.tool} themeColors={themeColors} />
+        <div className="mt-2 grid grid-cols-3 gap-1.5">
+          {TOOL_TYPES.map((tt) => (
+            <button
+              key={tt.id}
+              onClick={() => onTool({ type: tt.id })}
+              className={cn(
+                "flex flex-col items-center gap-1 rounded-md border px-1 py-1.5 transition-all hover:-translate-y-0.5",
+                params.tool.type === tt.id
+                  ? "border-brass/70 bg-brass/10 text-brass2 shadow-[0_0_12px_rgba(227,169,78,0.15)]"
+                  : "border-edge bg-panel2 text-mute hover:border-edge2 hover:text-ink"
+              )}
+            >
+              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinejoin="round">
+                {tt.glyph}
+              </svg>
+              <span className="text-[9.5px] font-bold">{tt.name}</span>
+            </button>
+          ))}
+        </div>
+        {params.tool.type === "angle" && (
+          <>
+            {/* دسته‌های تراش استاندارد */}
+            <div className="mt-2 grid grid-cols-3 gap-1.5">
+              {(Object.keys(HAND_INFO) as ToolHand[]).map((h) => {
+                const on = params.tool.hand === h;
+                return (
+                  <button
+                    key={h}
+                    onClick={() => onTool({ hand: h })}
+                    className={cn(
+                      "flex flex-col items-center gap-1 rounded-md border px-1 py-2 transition-all hover:-translate-y-0.5",
+                      on
+                        ? "border-brass/70 bg-brass/10 text-brass2 shadow-[0_0_12px_rgba(227,169,78,0.15)]"
+                        : "border-edge bg-panel2 text-mute hover:border-edge2 hover:text-ink"
+                    )}
+                  >
+                    <svg viewBox="0 0 24 24" className="h-6 w-6" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinejoin="round">
+                      {HAND_GLYPHS[h]}
+                    </svg>
+                    <span className="text-[10px] font-bold">{HAND_INFO[h].name}</span>
+                    <span className="font-mono text-[8.5px] text-dim">{HAND_INFO[h].desc}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {/* شعاع نوک — تنها پارامتر قابل تغییر */}
+            <div className="mt-2">
+              <span className="mb-1 block text-[10.5px] font-semibold text-mute">شعاع نوک اینسرت (Rε)</span>
+              <div className="flex overflow-hidden rounded-md border border-edge" dir="ltr">
+                {NOSE_RADII.map((r) => (
+                  <button
+                    key={r}
+                    onClick={() => onTool({ nose: r })}
+                    className={cn(
+                      "flex-1 py-1.5 font-mono text-[11px] font-bold transition-colors",
+                      Math.abs(params.tool.nose - r) < 1e-6
+                        ? "bg-brass text-[var(--color-brass-ink)]"
+                        : "bg-panel2 text-mute hover:bg-panel3 hover:text-ink"
+                    )}
+                  >
+                    R{r}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <p className="mt-1.5 rounded-md bg-bg/50 px-2 py-1 font-mono text-[9.5px] text-dim" dir="ltr">
+              INSERT: V{INSERT_ANGLE}° • {HAND_INFO[params.tool.hand].k}° • R{params.tool.nose}
+            </p>
+          </>
+        )}
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          {params.tool.type === "round" && (
+            <Num label="شعاع اینسرت (R)" unit="mm" value={params.tool.radius} min={1} max={15} step={0.5} onChange={(v) => onTool({ radius: v })} />
+          )}
+          {params.tool.type === "groove" && (
+            <>
+              <Num label="پهنای تیغه (W)" unit="mm" value={params.tool.width} min={1} max={10} step={0.5} onChange={(v) => onTool({ width: v })} />
+              <Num label="شعاع گوشه" unit="mm" value={params.tool.corner} min={0} max={1} step={0.05} onChange={(v) => onTool({ corner: v })} />
+            </>
+          )}
+          <Num label="پهنای دنباله" unit="mm" value={params.tool.shank} min={6} max={30} step={1} onChange={(v) => onTool({ shank: v })} />
+        </div>
+        <p className="mt-1.5 rounded-md bg-bg/50 px-2 py-1 text-[9.5px] leading-4 text-dim">
+          شکل هندسی این ابزار دقیقاً همان هندسهٔ براده‌برداری در شبیه‌سازی است؛ لبهٔ برنده در پیش‌نمایش طلایی و در شبیه‌سازی هنگام تراش روشن می‌شود.
+        </p>
+      </Section>
+
+      {/* ابعاد خام */}
+      <Section title="قطعه خام" icon={<IconSpindle className="h-3.5 w-3.5 text-brass" />}>
+        <BlankDims
+          blankD={params.blankD}
+          blankL={params.blankL}
+          onApply={(d, l) => onParams({ blankD: d, blankL: l })}
+        />
+
+        {/* شکل مقطع خام */}
+        <div className="mt-2.5">
+          <span className="mb-1 block text-[10.5px] font-semibold text-mute">شکل مقطع خام</span>
+          <div className="grid grid-cols-4 gap-1.5">
+            {BLANK_SHAPES.map((sh) => {
+              const on = params.blankShape === sh.id;
+              return (
+                <button
+                  key={sh.id}
+                  onClick={() => onParams({ blankShape: sh.id })}
+                  className={cn(
+                    "flex flex-col items-center gap-1 rounded-md border px-0.5 py-1.5 transition-all hover:-translate-y-0.5",
+                    on
+                      ? "border-brass/70 bg-brass/10 text-brass2 shadow-[0_0_12px_rgba(227,169,78,0.15)]"
+                      : "border-edge bg-panel2 text-mute hover:border-edge2 hover:text-ink"
+                  )}
+                  title={sh.sides === 0 ? "مقطع دایره‌ای — بدون گوشه" : `مقطع ${sh.name} — ${faNum(sh.sides)} گوشه`}
+                >
+                  <ShapeGlyph sides={sh.sides} />
+                  <span className="text-[8.5px] font-bold leading-tight">{sh.name}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* پیش‌نمایش پوشش دورانی */}
+        <RotationalEnvelopePreview
+          blankD={params.blankD}
+          shape={params.blankShape}
+          rpm={params.rpm}
+        />
+      </Section>
+
+      {/* پارامترهای تراش */}
+      <Section title="پارامترهای برداشت">
+        <div className="grid grid-cols-2 gap-2">
+          <Num label="عمق بار / گام بیرونی" unit="mm" value={params.doc} min={0.5} max={10} step={0.5} onChange={(v) => onParams({ doc: v })} />
+          <Num label="عمق بار داخل‌تراشی" unit="mm" value={params.innerDoc} min={0.5} max={10} step={0.5} onChange={(v) => onParams({ innerDoc: Math.min(10, Math.max(0.5, v)) })} />
+          <Num label="فاصله آفست" unit="mm" value={params.offsetDist} min={0} max={3} step={0.1} onChange={(v) => onParams({ offsetDist: v })} />
+          <Num label="فاصله آفست داخل تراش" unit="mm" value={params.innerOffsetDist} min={0} max={3} step={0.1} onChange={(v) => onParams({ innerOffsetDist: v })} />
+          <Num label="فاصله شروع داخل تراشی" unit="mm" value={params.innerStartClearance} min={MIN_INNER_DISTANCE} max={MAX_INNER_DISTANCE} step={1} onChange={(v) => onParams({ innerStartClearance: Math.min(MAX_INNER_DISTANCE, Math.max(MIN_INNER_DISTANCE, v)) })} />
+          <Num label="فاصله پایان داخل تراشی" unit="mm" value={params.innerEndTravel} min={MIN_INNER_DISTANCE} max={MAX_INNER_DISTANCE} step={1} onChange={(v) => onParams({ innerEndTravel: Math.min(MAX_INNER_DISTANCE, Math.max(MIN_INNER_DISTANCE, v)) })} />
+          <Num label="همپوشانی خشن بیرون و کف تراشی" unit="mm" value={params.bottomRoughOverlap} min={0} max={50} step={0.5} onChange={(v) => onParams({ bottomRoughOverlap: Math.min(50, Math.max(0, v)) })} />
+          <Num label="فاصله کف تراشی از افست داخل" unit="mm" value={params.bottomOffsetClearance} min={0} max={100} step={0.5} onChange={(v) => onParams({ bottomOffsetClearance: Math.min(100, Math.max(0, v)) })} />
+          <Num label="برداشت اضافه از هر طرف" unit="mm" value={params.extraCutEachSide} min={0} max={10} step={0.5} onChange={(v) => onParams({ extraCutEachSide: Math.min(10, Math.max(0, v)) })} />
+
+          <Num label="فاصله امن" unit="mm" value={params.safety} min={1} max={20} step={1} onChange={(v) => onParams({ safety: v })} />
+          <Num label="جابجایی جی‌کد محور X" unit="mm" value={params.gcodeShiftX} step={0.5} onChange={(v) => onParams({ gcodeShiftX: v })} />
+          <Num label="جابجایی جی‌کد محور Y" unit="mm" value={params.gcodeShiftY} step={0.5} onChange={(v) => onParams({ gcodeShiftY: v })} />
+        </div>
+        <div className="mt-2 rounded-md border border-edge bg-panel2 p-2.5">
+          <label className="flex cursor-pointer items-center gap-2 text-[10.5px] font-semibold text-ink">
+            <input type="checkbox" checked={params.smartTransferEnabled} onChange={(e) => onParams({ smartTransferEnabled: e.target.checked })} className="accent-brass" />
+            حرکت انتقالی هوشمند برای خطوط زاویه‌دار
+          </label>
+          {params.smartTransferEnabled && (
+            <div className="mt-2 grid grid-cols-2 gap-2">
+              <Num label="زاویه اول" unit="°" value={params.smartTransferAngleMin} min={0} max={90} step={1} onChange={(v) => onParams({ smartTransferAngleMin: Math.min(90, Math.max(0, v)) })} />
+              <Num label="زاویه دوم" unit="°" value={params.smartTransferAngleMax} min={0} max={90} step={1} onChange={(v) => onParams({ smartTransferAngleMax: Math.min(90, Math.max(0, v)) })} />
+            </div>
+          )}
+          <p className="mt-1.5 text-[9px] leading-4 text-dim">برای آفست و پرداخت داخل/خارج؛ بازه بدون توجه به ترتیب دو زاویه محاسبه می‌شود.</p>
+        </div>
+        <p className="mt-1.5 rounded-md bg-bg/50 px-2 py-1 text-[9.5px] leading-4 text-dim">
+          فاصله امن، حداقل فاصله همه جابه‌جایی‌های سریع (G0) است: بیرون ‎+Y‎ از خط خارجی و بیرون ‎+X‎ از خط داخلی.
+        </p>
+        <div className="mt-2">
+          <span className="mb-1 block text-[10.5px] font-semibold text-mute">روش خشن‌تراشی</span>
+          <div className="flex overflow-hidden rounded-md border border-edge" dir="ltr">
+            {ROUGH_MODES.map((m, i) => (
+              <button
+                key={m.id}
+                onClick={() => onParams({ roughMode: m.id })}
+                className={cn(
+                  "flex flex-1 flex-col items-center gap-1 px-0.5 py-2 transition-colors",
+                  i > 0 && "border-l border-edge",
+                  params.roughMode === m.id
+                    ? m.id === "zone"
+                      ? "bg-copper text-[var(--color-brass-ink)]"
+                      : m.id === "zigzag"
+                        ? "bg-teal text-[var(--color-brass-ink)]"
+                        : "bg-brass text-[var(--color-brass-ink)]"
+                    : "bg-panel2 text-mute hover:bg-panel3 hover:text-ink"
+                )}
+                title={
+                  m.id === "zone"
+                    ? "رفت‌وبرگشت درون هر ناحیه کامل می‌شود، سپس ناحیهٔ بعد — برای تمرکز بر هر ناحیه"
+                    : m.id === "zigzag"
+                      ? "رفت‌وبرگشت با دنبال‌کردن منحنی؛ هر گذر فقط نواحیِ باقی‌مانده را می‌تراشد و ناحیهٔ تمام‌شده دوباره تراش نمی‌خورد"
+                      : "ابزار پس از هر مسیر جمع کرده و به نقطه شروع بازمی‌گردد"
+                }
+              >
+                <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                  {m.id === "classic" && <path d="M4 8h13l-3-3M20 16H7l3 3" />}
+                  {m.id === "zigzag" && <path d="M3 7h15l-2.5-2.5M21 12H6l2.5-2.5M3 17h15l-2.5-2.5" />}
+                  {m.id === "zone" && (
+                    <>
+                      <rect x="3" y="6" width="7" height="12" rx="1" />
+                      <rect x="14" y="6" width="7" height="12" rx="1" />
+                      <path d="M10 12h4" strokeDasharray="1.5 1.5" />
+                    </>
+                  )}
+                </svg>
+                <span className="text-[9px] font-bold leading-tight">{m.name}</span>
+              </button>
+            ))}
+          </div>
+          <p className="mt-1 text-[9.5px] leading-4 text-dim">
+            {params.roughMode === "zone"
+              ? "ناحیه‌ای: رفت‌وبرگشت درون هر ناحیه کامل می‌شود، سپس ابزار به ناحیهٔ بعد می‌رود — مناسب وقتی می‌خواهید هر ناحیه پیش از بعدی تمام شود"
+                : params.roughMode === "zigzag"
+                ? "زیگزاگ: ابزار منحنی هر لایه را دنبال می‌کند و در هر گذر فقط بازه‌هایی را می‌تراشد که هنوز به برش نیاز دارند — ناحیه‌ای که تمام شده دوباره طی نمی‌شود (مثلاً وقتی عمق دره‌ها متفاوت است، گذرهای عمیق فقط درهٔ عمیق را می‌تراشند). گذر رفت و برگشت هر دو باربرداری می‌کنند و چون هر گذر فقط به عمق «بار» برش می‌زند، نیروی برش پخش شده و برای چوب شکننده امن است"
+                : "کلاسیک: ابزار پس از هر مسیر جمع کرده و برای مسیر بعد به نقطه شروع بازمی‌گردد"}
+          </p>
+        </div>
+
+        {params.roughMode === "zigzag" && (
+          <p className="anim-in mt-2 flex items-start gap-1.5 rounded-md border border-teal/30 bg-teal/10 px-2 py-1.5 text-[9.5px] leading-4 text-teal">
+            <IconCheck className="mt-0.5 h-3 w-3 shrink-0" />
+            گذرهای رفت و برگشت هر دو با فیدر خشن باربرداری می‌کنند و ناحیهٔ تمام‌شده دوباره تراش نمی‌خورد؛ فقط برای پرش بین دو بازهٔ جدا، یک عبور امنِ کوتاه انجام می‌شود.
+          </p>
+        )}
+
+        {params.roughMode === "zone" && (
+          <div className="anim-in mt-2.5 border-t border-edge pt-2.5">
+            <ZoneOrderEditor
+              key={params.blankL + "|" + params.zoneBounds.join(",")}
+              blankL={params.blankL}
+              blankR={params.blankD / 2}
+              /* شکل مرجع باید از خود پروفایل باشد، نه مسیر آفست؛ مسیر آفست
+                 در نوک Split باعث فاصله و خط اضافی روی تصویر می‌شد. */
+              samples={outerDisplaySamples}
+              innerSamples={innerZoneSamples}
+              autoZones={autoZones}
+              committedBounds={params.zoneBounds}
+              committedOrder={params.zoneOrder}
+              onConfirm={({ bounds, order }) => {
+                onParams({ zoneBounds: bounds, zoneOrder: order });
+                onNotify("نواحی و ترتیب آن‌ها اعمال شد — جی‌کد به‌روز شد");
+              }}
+              onReset={({ defaults }) => {
+                onParams({ zoneBounds: [], ...(defaults ? { zoneOrder: [] } : {}) });
+              }}
+            />
+          </div>
+        )}
+
+        <div className="mt-4 border-t border-edge pt-3">
+          <span className="mb-1 block text-[10.5px] font-semibold text-mute">روش خشن تراشی داخل</span>
+          <div className="flex overflow-hidden rounded-md border border-edge" dir="ltr">
+            {ROUGH_MODES.map((m,i)=><button key={m.id} onClick={()=>onParams({innerRoughMode:m.id})} className={cn("flex flex-1 flex-col items-center gap-1 px-1 py-2",i>0&&"border-l border-edge",params.innerRoughMode===m.id?m.id==="zone"?"bg-copper text-[var(--color-brass-ink)]":m.id==="zigzag"?"bg-teal text-[var(--color-brass-ink)]":"bg-brass text-[var(--color-brass-ink)]":"bg-panel2 text-mute")}>
+              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={1.8}>{m.id==="classic"?<path d="M4 8h13l-3-3M20 16H7l3 3"/>:m.id==="zigzag"?<path d="M3 7h15l-2.5-2.5M21 12H6l2.5-2.5M3 17h15l-2.5-2.5"/>:<><rect x="3" y="6" width="7" height="12" rx="1"/><rect x="14" y="6" width="7" height="12" rx="1"/></>}</svg>
+              <span className="text-[9px] font-bold">{m.name}</span>
+            </button>)}
+          </div>
+          <p className="mt-1 text-[9.5px] leading-4 text-dim">{params.innerRoughMode==="classic"?"یک طرفه: همان روش فعلی داخل‌تراشی؛ ابزار پس از هر پاس به نقطه شروع برمی‌گردد.":params.innerRoughMode==="zigzag"?"دو طرفه: پاس‌های شعاعی رفت و برگشت هر دو باربرداری می‌کنند.":"ناحیه‌ای دو طرفه: هر ناحیه شعاعی با پاس‌های رفت و برگشت کامل و سپس ناحیه بعدی اجرا می‌شود."}</p>
+          {params.innerRoughMode==="zone"&&<InnerRadialZoneEditor key={`${params.blankD}|${params.innerZoneBounds.join(",")}|${innerZoneSamples.length}|${Math.max(0,...innerZoneSamples.map(s=>s.r)).toFixed(2)}`} blankR={params.blankD/2} samples={innerZoneSamples} outerSamples={outerDisplaySamples} bounds={params.innerZoneBounds} order={params.innerZoneOrder} onConfirm={(bounds,order)=>{onParams({innerZoneBounds:bounds,innerZoneOrder:order});onNotify("نواحی داخل‌تراشی اعمال شد — جی‌کد به‌روز شد");}}/>}
+        </div>
+      </Section>
+
+      <p className="px-1 pb-2 text-[10.5px] leading-5 text-dim">
+        عملیات‌ها به ترتیبِ فهرست اجرا می‌شوند؛ با جابه‌جایی، حذف و افزودن آن‌ها استراتژی شخصی خود را بسازید. فلش‌ها روی مسیر، جهت حرکت ابزار را نشان می‌دهند.
+      </p>
+
+      {activeToolCompOp && (
+        <ToolCompDialog
+          op={activeToolCompOp}
+          outerSamples={outerDisplaySamples}
+          outerOffsetSamples={outerOffsetSamples}
+          innerSamples={[...innerZoneSamples].reverse()}
+          innerOffsetSamples={innerOffsetSamples}
+          onSaveOp={saveOpToolComp}
+          onSaveAllOps={saveAllOpsToolComp}
+          onClose={() => setToolCompOpId(null)}
+        />
+      )}
+
+      {pendingStrategy && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/65 p-4 backdrop-blur-[2px]" dir="rtl" role="dialog" aria-modal="true">
+          <div className="w-full max-w-[390px] rounded-xl border border-brass/45 bg-panel p-4 shadow-[0_24px_80px_rgba(0,0,0,.75)]">
+            <p className="text-center text-[13px] font-bold leading-7 text-ink">
+              همه تغییرات بازنشانی می شود آیا از تغییرات ایجاد شده صرف نظر میکنید؟
+            </p>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                className="btn justify-center py-2 text-[12px] font-bold"
+                onClick={() => {
+                  onStrategy(pendingStrategy.id, pendingStrategy.name, pendingStrategy.types);
+                  setPendingStrategy(null);
+                }}
+              >بله</button>
+              <button
+                type="button"
+                className="btn btn-brass justify-center py-2 text-[12px] font-bold"
+                onClick={() => setPendingStrategy(null)}
+              >خیر</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* جمع‌شدن باکس‌های تنظیمات با دابل‌کلیک روی عنوان — وضعیت در localStorage می‌ماند */
+const COLLAPSED_SECTIONS_KEY = "xarat-code.sections-collapsed";
+function loadCollapsedSections(): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_SECTIONS_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function Section({ title, icon, children }: { title: string; icon?: ReactNode; children: ReactNode }) {
+  const [collapsed, setCollapsed] = useState(() => !!loadCollapsedSections()[title]);
+  useEffect(() => {
+    const applyCommand = (event: Event) => {
+      setCollapsed((event as CustomEvent<boolean>).detail);
+    };
+    window.addEventListener(SECTION_COLLAPSE_COMMAND, applyCommand);
+    return () => window.removeEventListener(SECTION_COLLAPSE_COMMAND, applyCommand);
+  }, []);
+  const toggle = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    try {
+      const map = loadCollapsedSections();
+      if (next) map[title] = true;
+      else delete map[title];
+      localStorage.setItem(COLLAPSED_SECTIONS_KEY, JSON.stringify(map));
+    } catch {
+      /* ignore */
+    }
+    window.dispatchEvent(new Event(SECTION_COLLAPSE_CHANGED));
+  };
+  return (
+    <section className={cn("rounded-lg border border-edge bg-panel transition-colors", collapsed ? "px-2.5 py-1.5" : "p-2.5")}>
+      <h3
+        onDoubleClick={toggle}
+        title={collapsed ? "دابل‌کلیک: باز کردن بخش" : "دابل‌کلیک: جمع کردن بخش"}
+        className={cn(
+          "group/head flex cursor-pointer select-none items-center gap-1.5 font-display text-[14px] leading-none text-ink/95",
+          !collapsed && "mb-2"
+        )}
+      >
+        {icon}
+        <span className="flex-1 truncate">{title}</span>
+        <svg
+          viewBox="0 0 12 12"
+          className={cn("h-2.5 w-2.5 shrink-0 text-dim transition-transform group-hover/head:text-brass", collapsed && "-rotate-180")}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth={1.8}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M2 8l4-4 4 4" />
+        </svg>
+      </h3>
+      {!collapsed && <div>{children}</div>}
+    </section>
+  );
+}
+
+function MiniBtn({
+  children,
+  onClick,
+  disabled,
+  danger,
+  tight,
+  title,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+  /** نسخهٔ نیم‌قد برای ستون فلش‌های روی‌هم */
+  tight?: boolean;
+  title: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className={cn(
+        "grid h-5.5 w-5.5 place-items-center rounded border border-transparent text-mute transition-colors",
+        tight && "!h-[13px] py-0",
+        danger ? "hover:border-danger/50 hover:text-danger" : "hover:border-edge2 hover:text-ink",
+        disabled && "cursor-not-allowed opacity-25 hover:border-transparent hover:text-mute"
+      )}
+    >
+      <svg viewBox="0 0 12 12" className={cn("h-3 w-3", tight && "h-2.5 w-2.5")} fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+        {children}
+      </svg>
+    </button>
+  );
+}
+
+/* گلیف کوچک شکل مقطع */
+function ShapeGlyph({ sides }: { sides: number }) {
+  if (sides === 0)
+    return (
+      <svg viewBox="0 0 20 20" className="h-4 w-4">
+        <circle cx="10" cy="10" r="6.6" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      </svg>
+    );
+  const pts = Array.from({ length: sides }, (_, k) => {
+    const a = (k / sides) * 2 * Math.PI + Math.PI / sides;
+    return `${(10 + 7.2 * Math.cos(a)).toFixed(1)},${(10 + 7.2 * Math.sin(a)).toFixed(1)}`;
+  }).join(" ");
+  return (
+    <svg viewBox="0 0 20 20" className="h-4 w-4">
+      <polygon points={pts} fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+/* پیش‌نمایش پوشش دورانی — چرخش مقطع و محدودهٔ جاروب‌شده توسط گوشه‌ها */
+function RotationalEnvelopePreview({ blankD, shape, rpm }: { blankD: number; shape: BlankShape; rpm: number }) {
+  const env = rotationalEnvelope(blankD, shape);
+  const W = 240;
+  const H = 196;
+  const cx = 120;
+  const cy = 88;
+  const maxR = 56;
+  const scale = maxR / env.outR;
+  const inPx = env.inR * scale;
+  const outPx = env.outR * scale;
+  const n = env.sides;
+  const dur = Math.min(6, Math.max(1.1, 900 / rpm));
+  const phase = n ? Math.PI / n : 0;
+
+  const poly = (R: number, ph: number) =>
+    Array.from({ length: n }, (_, k) => {
+      const a = (k / n) * 2 * Math.PI + ph;
+      return `${(cx + R * Math.cos(a)).toFixed(1)},${(cy + R * Math.sin(a)).toFixed(1)}`;
+    }).join(" ");
+
+  const corners = n
+    ? Array.from({ length: n }, (_, k) => {
+        const a = (k / n) * 2 * Math.PI + phase;
+        return { x: cx + outPx * Math.cos(a), y: cy + outPx * Math.sin(a) };
+      })
+    : [];
+
+  const growthPct = env.growth > 0 ? (env.growth / blankD) * 100 : 0;
+
+  return (
+    <div className="mt-2.5 overflow-hidden rounded-lg border border-edge bg-[var(--theme-editor-bg)]">
+      <div className="flex items-center justify-between border-b border-edge/60 px-2.5 py-1.5">
+        <span className="text-[10px] font-bold text-mute">پوشش دورانی — Rotational Envelope</span>
+        <span className="font-mono text-[9px] text-dim" dir="ltr">
+          {rpm} rpm
+        </span>
+      </div>
+
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full">
+        <defs>
+          <radialGradient id="envGlow" cx="50%" cy="50%" r="50%">
+            <stop offset="72%" stopColor="rgba(var(--rgb-teal), 0)" />
+            <stop offset="100%" stopColor="rgba(var(--rgb-teal), 0.2)" />
+          </radialGradient>
+        </defs>
+
+        {/* ناحیهٔ جاروب‌شده هنگام چرخش */}
+        <circle cx={cx} cy={cy} r={outPx} fill="url(#envGlow)" />
+        {/* دایرهٔ پوشش — قطر مؤثر دوران */}
+        <circle cx={cx} cy={cy} r={outPx} fill="none" stroke="var(--color-teal)" strokeWidth={1.7} />
+        {/* دایرهٔ قطر واقعی — محاطی */}
+        <circle cx={cx} cy={cy} r={inPx} fill="rgba(var(--rgb-brass), 0.06)" stroke="var(--color-brass)" strokeWidth={1.2} strokeDasharray="4 3" />
+
+        {/* مقطع در حال چرخش + گوشه‌ها */}
+        {n > 0 ? (
+          <g style={{ transformOrigin: `${cx}px ${cy}px`, animation: `spin360 ${dur}s linear infinite` }}>
+            <polygon points={poly(outPx, phase - 0.55)} fill="rgba(var(--rgb-brass), 0.08)" />
+            <polygon points={poly(outPx, phase - 0.28)} fill="rgba(var(--rgb-brass), 0.14)" />
+            <polygon points={poly(outPx, phase)} fill="rgba(var(--rgb-brass), 0.30)" stroke="var(--color-brass2)" strokeWidth={1.2} strokeLinejoin="round" />
+            {corners.map((c, i) => (
+              <circle key={i} cx={c.x} cy={c.y} r={2.7} fill="var(--color-copper)" stroke="var(--color-brass2)" strokeWidth={1} />
+            ))}
+          </g>
+        ) : (
+          <circle cx={cx} cy={cy} r={inPx} fill="rgba(var(--rgb-brass), 0.30)" stroke="var(--color-brass2)" strokeWidth={1.2} />
+        )}
+
+        {/* محور چرخش */}
+        <circle cx={cx} cy={cy} r={2.2} fill="var(--color-brass2)" />
+        <line x1={cx - 6} y1={cy} x2={cx + 6} y2={cy} stroke="var(--color-brass2)" strokeWidth={0.8} opacity={0.5} />
+
+        {/* برچسب بالای پوشش */}
+        <text x={cx} y={cy - outPx - 12} textAnchor="middle" fontSize={10.5} fontWeight={800} fontFamily="Vazirmatn, sans-serif" fill="var(--color-teal)">
+          ⌀ دوران {env.maxRotD.toFixed(1)}
+        </text>
+        {/* برچسب پایین قطر واقعی */}
+        <text x={cx} y={cy + outPx + 20} textAnchor="middle" fontSize={10} fontWeight={700} fontFamily="Vazirmatn, sans-serif" fill="var(--color-brass)">
+          ⌀ واقعی {faNum(blankD)}
+        </text>
+      </svg>
+
+      {/* آمار تفکیک‌شده */}
+      <div className="grid grid-cols-3 gap-px border-t border-edge/60 bg-edge/40 text-center">
+        <div className="bg-[var(--theme-editor-bg)] px-1 py-1.5">
+          <div className="text-[8.5px] font-semibold text-dim">قطر واقعی</div>
+          <div className="font-mono text-[11px] font-bold text-brass2" dir="ltr">
+            ⌀{faNum(blankD)}
+          </div>
+        </div>
+        <div className="bg-[var(--theme-editor-bg)] px-1 py-1.5">
+          <div className="text-[8.5px] font-semibold text-dim">قطر دوران</div>
+          <div className="font-mono text-[11px] font-bold text-teal" dir="ltr">
+            ⌀{env.maxRotD.toFixed(1)}
+          </div>
+        </div>
+        <div className="bg-[var(--theme-editor-bg)] px-1 py-1.5">
+          <div className="text-[8.5px] font-semibold text-dim">افزایش {n > 0 ? `(${faNum(n)} گوشه)` : ""}</div>
+          <div className="font-mono text-[11px] font-bold text-copper" dir="ltr">
+            {env.growth > 0 ? `+${env.growth.toFixed(1)} / ${growthPct.toFixed(0)}%` : "—"}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ابعاد خام با پیش‌نویس — فقط با کلیک روی «اعمال» روی قطعه و مسیر اثر می‌گذارد */
+function BlankDims({
+  blankD,
+  blankL,
+  onApply,
+}: {
+  blankD: number;
+  blankL: number;
+  onApply: (d: number, l: number) => void;
+}) {
+  const [d, setD] = useState(blankD);
+  const [l, setL] = useState(blankL);
+
+  /* اگر مقدار اعمال‌شده از جای دیگری (مثلاً پیش‌تنظیم) عوض شد، پیش‌نویس همگام شود */
+  useEffect(() => setD(blankD), [blankD]);
+  useEffect(() => setL(blankL), [blankL]);
+
+  const dirty = d !== blankD || l !== blankL;
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-2">
+        <Num label="قطر خام" unit="mm" value={d} step={2} onChange={setD} />
+        <Num label="طول خام" unit="mm" value={l} step={5} onChange={setL} />
+      </div>
+      <button
+        onClick={() => onApply(d, l)}
+        disabled={!dirty}
+        className={cn(
+          "btn w-full justify-center !py-2 text-[12.5px] font-bold transition-all",
+          dirty && "btn-brass shadow-[0_0_16px_rgba(227,169,78,0.28)]"
+        )}
+      >
+        <IconCheck className="h-4 w-4" />
+        اعمال
+      </button>
+      {dirty && (
+        <p className="anim-in text-center text-[10px] leading-4 text-brass2/80">
+          ابعاد تغییر کرده — برای اثرگذاری روی «اعمال» کلیک کنید
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* کالیبراسیون اختیاری هلدر دوم از روی مختصات مطلق دو هلدر. محاسبه و اعمال
+   debounce شده است تا هنگام تایپ، تولید مسیر چندبار پشت‌سرهم اجرا نشود. */
+function Holder2CoordinateCalibration({
+  current,
+  onApply,
+}: {
+  current: Holder2State;
+  onApply: (value: Holder2State) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [holder1, setHolder1] = useState<HolderMachinePoint>({ x: 0, y: 0 });
+  const [holder2, setHolder2] = useState<HolderMachinePoint>(() => ({
+    x: current.xOff,
+    y: -current.yOff,
+  }));
+
+  /* در حالت بسته، مختصات نمونه با افست مستقیم فعلی هماهنگ می‌ماند. مختصات H1
+     حفظ می‌شود و H2 متناظر با آن ساخته می‌شود تا بازکردن گزینه مقدار غافلگیرکننده نداشته باشد. */
+  useEffect(() => {
+    if (open) return;
+    const next = {
+      x: Math.round((holder1.x + current.xOff) * 100) / 100,
+      y: Math.round((holder1.y - current.yOff) * 100) / 100,
+    };
+    setHolder2((prev) => prev.x === next.x && prev.y === next.y ? prev : next);
+  }, [open, holder1.x, holder1.y, current.xOff, current.yOff]);
+
+  const detected = useMemo(
+    () => holder2OffsetFromCoordinates(holder1, holder2),
+    [holder1.x, holder1.y, holder2.x, holder2.y]
+  );
+  const finite = Number.isFinite(detected.xOff) && Number.isFinite(detected.yOff);
+  const xValid = finite && detected.xOff >= MIN_HOLDER2_OFFSET;
+  const yValid = finite && detected.yOff >= MIN_HOLDER2_OFFSET;
+  const valid = xValid && yValid;
+  const applied = valid &&
+    Math.abs(detected.xOff - current.xOff) < 1e-9 &&
+    Math.abs(detected.yOff - current.yOff) < 1e-9;
+
+  /* پس از توقف کوتاه تایپ، نتیجه معتبر خودکار وارد فیلدهای اصلی می‌شود. */
+  useEffect(() => {
+    if (!open || !valid || applied) return;
+    const timer = window.setTimeout(() => onApply(detected), 320);
+    return () => window.clearTimeout(timer);
+  }, [open, valid, applied, detected.xOff, detected.yOff, onApply]);
+
+  const detectedText = (v: number) => Number.isFinite(v) ? v.toFixed(2) : "—";
+
+  return (
+    <div className="mt-2 overflow-hidden rounded-md border border-teal/25 bg-bg/35">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-2 py-1.5 text-right transition-colors hover:bg-teal/5"
+      >
+        <span className="grid h-5 w-5 shrink-0 place-items-center rounded border border-teal/35 text-teal">
+          <svg viewBox="0 0 16 16" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 2.5h10v11H3zM5 5h6M5 8h1M8 8h1M11 8h0M5 11h1M8 11h1M11 11h0" />
+          </svg>
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-[10px] font-bold text-ink/90">محاسبه خودکار از مختصات دو هلدر</span>
+          <span className="block text-[8.5px] text-dim">روش اختیاری کالیبراسیون X و Y</span>
+        </span>
+        <span className="rounded-full border border-edge px-1.5 py-0.5 text-[8px] font-bold text-mute">اختیاری</span>
+        <svg viewBox="0 0 12 12" className={cn("h-2.5 w-2.5 text-dim transition-transform", open && "rotate-180")} fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+          <path d="M2 4l4 4 4-4" />
+        </svg>
+      </button>
+
+      {open && (
+        <div className="anim-in border-t border-teal/20 p-2">
+          <p className="mb-2 text-[9px] leading-4 text-mute">
+            ابتدا مختصات ماشینِ هلدر اول و سپس هلدر دوم را وارد کنید. نتیجه پس از توقف کوتاه تایپ، خودکار در افست‌های اصلی ثبت می‌شود.
+          </p>
+
+          <div className="grid grid-cols-2 gap-2 rounded-md border border-edge bg-panel/60 p-2">
+            <div className="col-span-2 flex items-center gap-1.5">
+              <span className="grid h-4 w-5 place-items-center rounded bg-brass/15 font-mono text-[8px] font-bold text-brass2">H1</span>
+              <span className="text-[9.5px] font-bold text-mute">مختصات هلدر اول</span>
+            </div>
+            <Num label="محور X" unit="mm" value={holder1.x} step={0.1} onChange={(x) => setHolder1((p) => ({ ...p, x }))} />
+            <Num label="محور Y" unit="mm" value={holder1.y} step={0.1} onChange={(y) => setHolder1((p) => ({ ...p, y }))} />
+          </div>
+
+          <div className="mt-1.5 grid grid-cols-2 gap-2 rounded-md border border-teal/20 bg-teal/5 p-2">
+            <div className="col-span-2 flex items-center gap-1.5">
+              <span className="grid h-4 w-5 place-items-center rounded bg-teal/15 font-mono text-[8px] font-bold text-teal">H2</span>
+              <span className="text-[9.5px] font-bold text-mute">مختصات هلدر دوم</span>
+            </div>
+            <Num label="محور X" unit="mm" value={holder2.x} step={0.1} onChange={(x) => setHolder2((p) => ({ ...p, x }))} />
+            <Num label="محور Y" unit="mm" value={holder2.y} step={0.1} onChange={(y) => setHolder2((p) => ({ ...p, y }))} />
+          </div>
+
+          <div className={cn(
+            "mt-2 rounded-md border px-2 py-1.5",
+            valid ? "border-teal/35 bg-teal/8" : "border-danger/35 bg-danger/8"
+          )}>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[9px] font-bold text-mute">افست تشخیص‌داده‌شده</span>
+              <span className={cn("text-[8.5px] font-bold", valid ? applied ? "text-teal" : "animate-pulse text-brass2" : "text-danger")}>
+                {valid ? applied ? "خودکار اعمال شد ✓" : "در حال ثبت خودکار…" : "مختصات نامعتبر"}
+              </span>
+            </div>
+            <div className="mt-1 grid grid-cols-2 gap-1 font-mono text-[10px] font-bold" dir="ltr">
+              <span className={xValid ? "text-teal" : "text-danger"}>Xoff = {detectedText(detected.xOff)}</span>
+              <span className={yValid ? "text-teal" : "text-danger"}>Yoff = {detectedText(detected.yOff)}</span>
+            </div>
+            {!valid && (
+              <p className="mt-1 text-[8.5px] leading-4 text-danger">
+                اختلاف هر محور باید حداقل {MIN_HOLDER2_OFFSET}mm باشد: H2.X باید بزرگ‌تر از H1.X و H2.Y باید کوچک‌تر از H1.Y باشد.
+              </p>
+            )}
+          </div>
+
+          <p className="mt-1.5 rounded bg-bg/60 px-2 py-1 font-mono text-[8.5px] leading-4 text-dim" dir="ltr">
+            Xoff = H2.X − H1.X &nbsp;•&nbsp; Yoff = H1.Y − H2.Y
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* فیلد عددی با پیش‌نویس — تایپ روان، اعتبارسنجی زنده، بازگشت به مقدار معتبر هنگام خروج */
+function Num({
+  label,
+  unit,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  label: string;
+  unit: string;
+  value: number;
+  min?: number;
+  max?: number;
+  step: number;
+  onChange: (v: number) => void;
+}) {
+  const [text, setText] = useState<string>(String(value));
+  const focused = useRef(false);
+
+  useEffect(() => {
+    if (!focused.current) setText(String(value));
+  }, [value]);
+
+  /* اگر min/max داده نشده باشد، عدد هیچ محدودیتی ندارد */
+  const clamp = (v: number) => {
+    let r = Math.round(v * 100) / 100;
+    if (Object.is(r, -0)) r = 0;
+    if (min !== undefined) r = Math.max(min, r);
+    if (max !== undefined) r = Math.min(max, r);
+    return r;
+  };
+
+  const commit = (raw: string) => {
+    const normalized = raw
+      .replace(/[−–—]/g, "-")
+      .replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
+      .replace(/[٠-٩]/g, (d) => String("٠١٢٣٤٥٦٧٨٩".indexOf(d)));
+    const v = parseFloat(normalized);
+    if (!Number.isNaN(v) && Number.isFinite(v)) {
+      onChange(clamp(v));
+    }
+  };
+
+  return (
+    <label className="block">
+      <span className="mb-1 block text-[10.5px] font-semibold text-mute">{label}</span>
+      <div className="relative">
+        <input
+          type="text"
+          inputMode={min !== undefined && min >= 0 ? "decimal" : undefined}
+          className="field-input pl-12"
+          value={text}
+          dir="ltr"
+          style={{ textAlign: "right" }}
+          onFocus={() => (focused.current = true)}
+          onChange={(e) => {
+            setText(e.target.value);
+            commit(e.target.value);
+          }}
+          onBlur={() => {
+            focused.current = false;
+            setText(String(value));
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            if (e.key === "ArrowUp") {
+              e.preventDefault();
+              const v = clamp(value + step);
+              onChange(v);
+              setText(String(v));
+            }
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              const v = clamp(value - step);
+              onChange(v);
+              setText(String(v));
+            }
+          }}
+        />
+        <span className="pointer-events-none absolute top-1/2 left-2 -translate-y-1/2 font-mono text-[9.5px] text-dim">{unit}</span>
+      </div>
+    </label>
+  );
+}
+
+/* گلیف جهت‌گیری اینسرت V 35° */
+const HAND_GLYPHS: Record<ToolHand, ReactNode> = {
+  center: <><path d="M12 4.5 14.5 20H9.5Z" /><path d="M12 4.5 12 20" strokeDasharray="2 2" /></>,
+  right: <><path d="M15 4.5 8 20H16.5Z" /><path d="M12 4.5v15.5" strokeDasharray="2 2" /></>,
+  left: <><path d="M9 4.5 16 20H7.5Z" /><path d="M12 4.5v15.5" strokeDasharray="2 2" /></>,
+};
+
+const TOOL_TYPES: { id: ToolType; name: string; glyph: ReactNode }[] = [
+  { id: "angle", name: "اینسرت زاویه‌دار", glyph: <><path d="M12 3.5 20.5 12 12 20.5 3.5 12Z" /><circle cx="12" cy="12" r="2.4" /></> },
+  { id: "round", name: "اینسرت گرد", glyph: <><circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="2.4" /></> },
+  { id: "groove", name: "تیغه شیارزن", glyph: <><path d="M4 8.5h16v7H4z" /><path d="M9.5 15.5v-3.5M14.5 15.5v-3.5" /></> },
+];
+
+/* پیش‌نمایش مهندسی ابزار — همان پروفایل براده‌برداری با اندازه‌گذاری */
+function ToolPreview({ tool, themeColors = DEFAULT_THEME_COLORS }: { tool: ToolSpec; themeColors?: ThemeColors }) {
+  const prof = useMemo(() => toolProfile(tool), [tool]);
+  const W = 224;
+  const H = 124;
+  const spanX = Math.max(2, prof.max - prof.min);
+  const s = Math.min((W - 72) / spanX, (H - 60) / Math.max(3, prof.height * 0.6 + 2));
+  const tipX = 42 - prof.min * s;
+  const tipY = H - 34;
+  const P = (dz: number, c: number): [number, number] => [tipX + dz * s, tipY - c * s];
+
+  let d = "";
+  prof.pts.forEach(([dz, c], i) => {
+    const [x, y] = P(dz, c);
+    d += `${i ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)} `;
+  });
+  const [xMaxE, yMaxE] = P(prof.max, prof.pts[prof.pts.length - 1][1]);
+  const [xMinE, yMinE] = P(prof.min, prof.pts[0][1]);
+  const yTop = Math.min(yMaxE, yMinE) - Math.min(26, prof.height * s * 0.45);
+  const midX = (xMinE + xMaxE) / 2;
+  const shW = Math.max(12, tool.shank * 0.45 * s);
+
+  const dim = (x1: number, y1: number, x2: number, y2: number, label: string, ly?: number) => {
+    const ang = Math.atan2(y2 - y1, x2 - x1);
+    const head = (x: number, y: number) =>
+      `M${x.toFixed(1)} ${y.toFixed(1)} l${(-4.5 * Math.cos(ang - 0.42)).toFixed(1)} ${(-4.5 * Math.sin(ang - 0.42)).toFixed(1)} M${x.toFixed(1)} ${y.toFixed(1)} l${(-4.5 * Math.cos(ang + 0.42)).toFixed(1)} ${(-4.5 * Math.sin(ang + 0.42)).toFixed(1)} `;
+    return (
+      <g>
+        <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={themeColors.editorGrid} strokeWidth={1} />
+        <path d={head(x1, y1) + head(x2, y2)} stroke={themeColors.editorGrid} strokeWidth={1} fill="none" />
+        <text
+          x={(x1 + x2) / 2}
+          y={ly ?? Math.min(y1, y2) - 4}
+          textAnchor="middle"
+          fontSize={9}
+          fontWeight={700}
+          fontFamily="JetBrains Mono, monospace"
+          fill={themeColors.uiInk}
+          stroke={themeColors.simBg}
+          strokeWidth={3}
+          paintOrder="stroke"
+        >
+          {label}
+        </text>
+      </g>
+    );
+  };
+
+  const gridX: number[] = [];
+  for (let z = Math.ceil(prof.min / 5) * 5; z <= prof.max; z += 5) gridX.push(z);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full rounded-md border border-edge" style={{ backgroundColor: themeColors.simBg }}>
+      <defs>
+        <linearGradient id="toolGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor={shadeHex(themeColors.simToolInsert, 0.2)} />
+          <stop offset="0.55" stopColor={themeColors.simToolInsert} />
+          <stop offset="1" stopColor={shadeHex(themeColors.simToolInsert, -0.32)} />
+        </linearGradient>
+      </defs>
+      {/* شبکه */}
+      {gridX.map((z) => (
+        <line key={z} x1={tipX + z * s} y1={12} x2={tipX + z * s} y2={tipY + 6} stroke={rgbaCss(themeColors.editorGrid, 0.14)} strokeWidth={1} />
+      ))}
+      {/* خط سطح قطعه */}
+      <line x1={8} y1={tipY} x2={W - 8} y2={tipY} stroke={rgbaCss(themeColors.simTargetOutline, 0.45)} strokeWidth={1} strokeDasharray="6 3 1.5 3" />
+      <text x={W - 10} y={tipY + 11} textAnchor="end" fontSize={7.5} fill={themeColors.editorGrid} fontFamily="JetBrains Mono, monospace">
+        سطح قطعه
+      </text>
+      {/* دنباله */}
+      <rect x={midX - shW / 2} y={yTop - 14} width={shW} height={16} fill={themeColors.simToolBody} stroke={shadeHex(themeColors.simToolBody, -0.45)} strokeWidth={1} />
+      {/* اینسرت */}
+      <path d={`${d} L${xMaxE.toFixed(1)} ${yTop.toFixed(1)} L${xMinE.toFixed(1)} ${yTop.toFixed(1)} Z`} fill="url(#toolGrad)" stroke="rgba(0,0,0,0.45)" strokeWidth={1} />
+      {/* لبه برنده */}
+      <path d={d} fill="none" stroke={themeColors.simToolTip} strokeWidth={2} strokeLinecap="round" />
+      {/* نوک */}
+      <circle cx={tipX} cy={tipY} r={2.4} fill={themeColors.simToolTip} />
+
+      {/* اندازه‌گذاری‌ها */}
+      {tool.type === "angle" && (
+        <g>
+          {/* شعاع نوک — تنها پارامتر */}
+          <circle cx={tipX} cy={tipY - tool.nose * s} r={Math.max(3, tool.nose * s)} fill="none" stroke={themeColors.opOffset} strokeWidth={1} strokeDasharray="2.5 2" />
+          {dim(tipX, tipY, tipX, tipY - tool.nose * s, `R${tool.nose}`, tipY - tool.nose * s - 5)}
+          {/* خط عمودی مبنا */}
+          <line x1={tipX} y1={tipY} x2={tipX} y2={yTop} stroke={rgbaCss(themeColors.editorGrid, 0.35)} strokeWidth={1} strokeDasharray="3 3" />
+          {/* برچسب اینسرت و دسته */}
+          <text x={midX} y={yTop + 13} textAnchor="middle" fontSize={9.5} fontWeight={700} fontFamily="JetBrains Mono, monospace" fill={shadeHex(themeColors.simToolInsert, -0.55)}>
+            V{tool.angle}°
+          </text>
+          <text x={midX} y={yTop - 3} textAnchor="middle" fontSize={9.5} fontWeight={700} fontFamily="JetBrains Mono, monospace" fill={themeColors.uiInk} stroke={themeColors.simBg} strokeWidth={3} paintOrder="stroke">
+            {HAND_INFO[tool.hand].name} {HAND_INFO[tool.hand].k}°
+          </text>
+        </g>
+      )}
+      {tool.type === "groove" && (
+        <g>
+          {dim(xMinE, tipY + 8, xMaxE, tipY + 8, `W ${tool.width}`, tipY + 22)}
+          <text x={tipX + (prof.max - prof.min) * s + 8} y={tipY - 4} fontSize={8.5} fontWeight={700} fontFamily="JetBrains Mono, monospace" fill={themeColors.uiInk} stroke={themeColors.simBg} strokeWidth={3} paintOrder="stroke">
+            R{tool.corner}
+          </text>
+        </g>
+      )}
+      {tool.type === "round" && (
+        <g>
+          {(() => {
+            const [ax, ay] = P(tool.radius * 0.7, tool.radius - Math.sqrt(Math.max(0, tool.radius ** 2 - (tool.radius * 0.7) ** 2)));
+            return dim(ax, ay, ax + 22, ay - 14, `R ${tool.radius}`, ay - 22);
+          })()}
+        </g>
+      )}
+    </svg>
+  );
+}
+
+const faNum = (n: number) => String(n).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
+const clampZ = (v: number, blankL: number) => Math.min(blankL, Math.max(0, v));
+
+/* تولید نواحی از هر تقسیم‌بندی */
+function zonesFromBounds(bounds: number[], blankL: number): { a: number; b: number }[] {
+  const all = [0, ...bounds.sort((a, b) => a - b).filter((v) => v > 0.3 && v < blankL - 0.3), blankL];
+  const zones: { a: number; b: number }[] = [];
+  for (let i = 0; i < all.length - 1; i++) {
+    if (all[i + 1] - all[i] > 0.3) zones.push({ a: all[i], b: all[i + 1] });
+  }
+  return zones.length ? zones : [{ a: 0, b: blankL }];
+}
+
+/* ویرایش نواحی داخل‌تراشی: مرزها شعاعی‌اند، بنابراین برخلاف خشن بیرونی
+   جداکننده‌ها به‌صورت افقی روی نمای قطعه نمایش داده می‌شوند. */
+function InnerRadialZoneEditor({blankR,samples,outerSamples,bounds:committed,order:committedOrder,onConfirm}:{blankR:number;samples:Sample[];outerSamples:Sample[];bounds:number[];order:number[];onConfirm:(b:number[],o:number[])=>void}){
+  const profileSamples=[...samples,...outerSamples];
+  const radialMax=samples.length?Math.max(.001,...samples.map(s=>s.r)):blankR;
+  const displayMaxR=profileSamples.length?Math.max(.001,...profileSamples.map(s=>s.r)):blankR;
+  /* نبود مرز دستی یعنی کل شعاع حفره یک ناحیه است؛ مرز پیش‌فرضِ وسط
+     فقط باعث دو نیم‌شدن ناخواستهٔ کار می‌شد. */
+  const initial=committed.length?[...committed]:[];
+  const [bounds,setBounds]=useState<number[]>(initial);
+  const [order,setOrder]=useState<number[]>([...committedOrder]);
+  const [drag,setDrag]=useState<number|null>(null),[hover,setHover]=useState<number|null>(null);
+  const svgRef=useRef<SVGSVGElement>(null),W=240,H=240,P=12;
+  const minZ=profileSamples.length?Math.min(...profileSamples.map(s=>s.z)):0,maxZ=profileSamples.length?Math.max(...profileSamples.map(s=>s.z)):1;
+  const zSpan=Math.max(.001,maxZ-minZ);
+  /* کادر همیشه مربع است، اما Scale هر دو محور دقیقاً یکسان می‌ماند. شکل مانند
+     پنجره طراحی با contain در مرکز کادر جا می‌شود و هیچ کشیدگی ندارد. */
+  const SCALE=Math.min((W-2*P)/zSpan,(H-2*P)/displayMaxR);
+  const DRAW_W=zSpan*SCALE,DRAW_H=displayMaxR*SCALE;
+  const LEFT=(W-DRAW_W)/2,BASE_Y=(H+DRAW_H)/2;
+  const X=(z:number)=>LEFT+(z-minZ)*SCALE;
+  const Y=(r:number)=>BASE_Y-r*SCALE;
+  const radial=(e:React.PointerEvent|React.MouseEvent)=>{const q=svgRef.current!.getBoundingClientRect();const py=((e.clientY-q.top)/q.height)*H;const shown=(BASE_Y-py)/SCALE;return Math.max(.5,Math.min(radialMax-.5,shown));};
+  const zones=useMemo(()=>{const e=[0,...bounds.filter(v=>v<radialMax).slice().sort((a,b)=>a-b),radialMax];return e.slice(0,-1).map((a,i)=>({a,b:e[i+1]}));},[bounds,radialMax]);
+  useEffect(()=>setOrder(o=>o.filter(i=>i<zones.length)),[zones.length]);
+  const toggle=(i:number)=>setOrder(o=>o.includes(i)?o.filter(x=>x!==i):[...o,i]);
+  const valid=order.length===zones.length&&new Set(order).size===zones.length;
+  const linePath=(src:Sample[])=>src.length?`M ${src.map(s=>`${X(s.z).toFixed(1)} ${Y(s.r).toFixed(1)}`).join(' L ')}`:'';
+  const innerPath=linePath(samples),outerPath=linePath(outerSamples);
+  /* فقط خود خطوط پروفایل نمایش داده می‌شوند؛ سطح بین شاخه داخلی و بیرونی
+     عمداً بدون Fill است تا نواحی قهوه‌ای اضافی روی شکل ایجاد نشود. */
+  const add=(e:React.MouseEvent<SVGSVGElement>)=>{if(drag!==null)return;const v=Math.round(radial(e));if(!bounds.some(x=>Math.abs(x-v)<2)){setBounds([...bounds,v].sort((a,b)=>a-b));setOrder([]);}};
+  return <div className="anim-in mt-2.5 border-t border-edge pt-2.5">
+    <div className="mb-1.5 flex items-center justify-between"><span className="text-[10.5px] font-semibold text-mute">نواحی + ترتیب (دستی)</span><span className="rounded-full border border-edge px-2 py-0.5 text-[9px] font-bold text-mute">{faNum(zones.length)} ناحیه</span></div>
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} className="aspect-square w-full select-none touch-none rounded-md border border-edge bg-[var(--theme-editor-bg)]" style={{cursor:drag!==null?'ns-resize':'crosshair'}} onClick={add} onPointerMove={e=>{if(drag!==null){const raw=Math.round(radial(e));setBounds(bs=>{const lo=drag>0?bs[drag-1]+1:.5,hi=drag<bs.length-1?bs[drag+1]-1:radialMax-.5,v=Math.max(lo,Math.min(hi,raw));return bs.map((b,i)=>i===drag?v:b)});}}} onPointerUp={()=>{setBounds(bs=>[...bs].sort((a,b)=>a-b));setDrag(null)}} onPointerLeave={()=>{setDrag(null);setHover(null)}}>
+      {innerPath?<><path d={outerPath} fill="none" stroke="rgba(var(--rgb-brass), .7)" strokeWidth="1.2"/><path d={innerPath} fill="none" stroke="var(--color-teal)" strokeWidth="1.5"/></>:<text x={W/2} y={H/2} textAnchor="middle" fill="var(--color-dim)" fontSize="10">خط داخل‌تراشی موجود نیست</text>}
+      {zones.map((z,i)=>{const pos=order.indexOf(i),cy=(Y(z.a)+Y(z.b))/2;return <g key={i}><rect x={P} y={Math.min(Y(z.a),Y(z.b))} width={W-2*P} height={Math.abs(Y(z.a)-Y(z.b))} fill={pos>=0?'rgba(var(--rgb-teal), .14)':'transparent'}/><g className="cursor-pointer" onClick={e=>{e.stopPropagation();toggle(i)}}><circle cx={W/2} cy={cy} r={pos>=0?9:8.5} fill={pos>=0?'var(--color-copper)':'var(--theme-editor-bg)'} stroke={pos>=0?'var(--theme-editor-bg)':'var(--color-dim)'} strokeDasharray={pos>=0?undefined:'2.5 2'}/><text x={W/2} y={cy+3.5} textAnchor="middle" fontSize="10" fontWeight="800" fill={pos>=0?'#fff7ec':'var(--color-dim)'}>{faNum(pos>=0?pos+1:i+1)}</text></g></g>})}
+      {bounds.map((v,i)=>{const y=Y(v),on=drag===i||hover===i;return <g key={i} className="cursor-ns-resize" onPointerDown={e=>{e.stopPropagation();(e.target as Element).setPointerCapture?.(e.pointerId);setDrag(i)}} onPointerEnter={()=>setHover(i)} onPointerLeave={()=>setHover(null)}><rect x={P-2} y={y-6} width={W-2*P+4} height="12" fill="transparent"/><line x1={P} x2={W-P} y1={y} y2={y} stroke={on?'var(--color-brass2)':'var(--color-teal)'} strokeWidth="1.6" strokeDasharray="4 3"/><circle cx={P} cy={y} r={on?5:4} fill={on?'var(--color-brass2)':'var(--color-teal)'} stroke="var(--theme-editor-bg)" strokeWidth="1.5"/><text x={P+8} y={y-5} fontSize="8" fill={on?'var(--color-brass2)':'var(--color-teal)'}>R{Math.round(v)}</text>{on&&<g className="cursor-pointer" onClick={e=>{e.stopPropagation();setBounds(bs=>bs.filter((_,j)=>j!==i));setOrder([])}}><circle cx={P+10} cy={y+7} r="5.5" fill="var(--color-danger)" stroke="var(--theme-editor-bg)"/><text x={P+10} y={y+10} textAnchor="middle" fontSize="9" fontWeight="900" fill="#fff">×</text></g>}</g>})}
+    </svg>
+    <p className="mt-1 text-[9.5px] leading-4 text-dim"><span className="text-teal">مرزهای افقی را بکشید یا روی پس‌زمینه کلیک کنید تا جداکننده جدید شود</span>؛ برای حذف روی مرز بروید و × را بزنید. سپس دایره‌های شماره را به ترتیب اجرا انتخاب کنید.</p>
+    <button onClick={()=>onConfirm([...bounds].sort((a,b)=>a-b),valid?order:zones.map((_,i)=>i))} className="btn btn-brass mt-2 w-full justify-center !py-2 text-[11px] font-bold"><IconCheck className="h-4 w-4"/>تأیید و ساخت جی‌کد</button>
+  </div>;
+}
+
+/* چیدمان کتروگرافی — ناحیهٔ محدود/محدود */
+function ZoneOrderEditor({
+  blankL,
+  blankR,
+  samples,
+  innerSamples,
+  autoZones,
+  committedBounds,
+  committedOrder,
+  onConfirm,
+  onReset,
+}: {
+  blankL: number;
+  blankR: number;
+  samples: Sample[];
+  innerSamples: Sample[];
+  autoZones: { a: number; b: number }[];
+  committedBounds: number[];
+  committedOrder: number[];
+  onConfirm: (p: { bounds: number[]; order: number[] }) => void;
+  onReset: (p: { defaults: boolean }) => void;
+}) {
+  /* مرزهای اولیه: از مرزهای کاربر یا از نوک قله‌های تقسیم خودکار (انتهای هر       */
+  /* ناحیه = نوک قلهٔ آن؛ با این روش آخرین قله نیز به‌درستی مرز می‌شود)           */
+  /* نبود مرز دستی یعنی کل طول خام یک ناحیه است؛ تقسیم خودکار فقط با
+     دکمهٔ «خودکار» اعمال می‌شود و نباید هنگام بازشدن پنجره ظاهر شود. */
+  const [bounds, setBounds] = useState<number[]>(
+    committedBounds.map((v) => clampZ(v, blankL))
+  );
+
+  const svgRef = useRef<SVGSVGElement>(null);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  const zones = useMemo(() => zonesFromBounds(bounds, blankL), [bounds, blankL]);
+  const n = zones.length;
+
+  /* اولویت‌ها */
+  const validCommittedOrder =
+    committedOrder.length === n &&
+    committedOrder.every((v) => v >= 0 && v < n) &&
+    new Set(committedOrder).size === n;
+  const [order, setOrder] = useState<number[]>(validCommittedOrder ? committedOrder : []);
+
+  /* هر بار تعداد نواحی تغییر کرد، فقط اولویت‌های معتبر نگه داشته می‌شوند */
+  useEffect(() => {
+    setOrder((p) => p.filter((v) => v < n));
+  }, [n]);
+
+  /* کادر مربعی و مقیاس واحد: محور Z و شعاع با یک ضریب رسم می‌شوند تا
+     قطعه در پنجرهٔ نواحی مثل خود قطعه کشیده نشود. */
+  const W = 240;
+  const H = 240;
+  const PAD = 12;
+  const YC = H / 2;
+  const displayR = Math.max(blankR, ...samples.map((s) => s.r), ...innerSamples.map((s) => s.r), 0.001);
+  const SCALE = Math.min((W - 2 * PAD) / Math.max(0.001, blankL), (H - 2 * PAD) / (2 * displayR));
+  const DRAW_W = blankL * SCALE;
+  const DRAW_R = displayR * SCALE;
+  const LEFT = (W - DRAW_W) / 2;
+  const X = (z: number) => LEFT + (z / Math.max(0.001, blankL)) * DRAW_W;
+  const Y = (r: number) => YC - r * SCALE;
+  const zFromX = (px: number) => clampZ(((px - LEFT) / Math.max(0.001, DRAW_W)) * blankL, blankL);
+  const DIV_TOP = Math.max(PAD, YC - DRAW_R);
+  const DIV_BOTTOM = Math.min(H - PAD, YC + DRAW_R);
+  const NUM_Y = Math.min(H - 10, DIV_BOTTOM + 16);
+
+  const pointerToZ = (e: React.PointerEvent | React.MouseEvent) => {
+    const el = svgRef.current;
+    if (!el) return 0;
+    const rect = el.getBoundingClientRect();
+    return zFromX(((e.clientX - rect.left) / Math.max(1, rect.width)) * W);
+  };
+
+  const loopPath = (src: Sample[]) => {
+    if (src.length < 2) return "";
+    let d = `M ${X(src[0].z).toFixed(1)} ${Y(src[0].r).toFixed(1)}`;
+    for (let i = 1; i < src.length; i++) d += ` L ${X(src[i].z).toFixed(1)} ${Y(src[i].r).toFixed(1)}`;
+    for (let i = src.length - 1; i >= 0; i--) d += ` L ${X(src[i].z).toFixed(1)} ${(2 * YC - Y(src[i].r)).toFixed(1)}`;
+    return d + " Z";
+  };
+  const silhouette = useMemo(() => loopPath(samples), [samples, blankL, blankR, innerSamples]);
+  const innerSilhouette = useMemo(() => loopPath(innerSamples), [innerSamples, blankL, blankR]);
+  const openPath = (src: Sample[], mirrored: boolean) => {
+    if (src.length < 2) return "";
+    return `M ${X(src[0].z).toFixed(1)} ${(mirrored ? 2 * YC - Y(src[0].r) : Y(src[0].r)).toFixed(1)} ${src.slice(1).map((s) => `L ${X(s.z).toFixed(1)} ${(mirrored ? 2 * YC - Y(s.r) : Y(s.r)).toFixed(1)}`).join(" ")}`;
+  };
+  const outerTop = openPath(samples, false);
+  const outerBottom = openPath(samples, true);
+  const innerTop = openPath(innerSamples, false);
+  const innerBottom = openPath(innerSamples, true);
+  /* اتصال لبهٔ دهانه: دو شاخه ممکن است به‌دلیل آفست/نمونه‌برداری رأس‌های
+     جدا داشته باشند، اما باید در نوک Split با یک خط کوتاه بسته شوند. */
+  const tipPair = samples.length >= 2 && innerSamples.length >= 2
+    ? (() => {
+        const outerEnds = [samples[0], samples[samples.length - 1]];
+        const innerEnds = [innerSamples[0], innerSamples[innerSamples.length - 1]];
+        let best = { outerTip: outerEnds[0], innerTip: innerEnds[0], distance: Infinity };
+        for (const outerTip of outerEnds) for (const innerTip of innerEnds) {
+          const distance = Math.abs(outerTip.z - innerTip.z);
+          if (distance < best.distance) best = { outerTip, innerTip, distance };
+        }
+        return best.distance <= Math.max(1, blankL * 0.02) ? best : null;
+      })()
+    : null;
+
+  const snapBound = (z: number, idx: number) => {
+    const lo = idx > 0 ? bounds[idx - 1] + 2 : 0.5;
+    const hi = idx < bounds.length - 1 ? bounds[idx + 1] - 2 : blankL - 0.5;
+    return Math.round(Math.min(hi, Math.max(lo, z)));
+  };
+
+  const onBgClick = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (dragIdx != null) return;
+    const z = Math.round(pointerToZ(e));
+    // اگر به مرز فعلی نزدیک بود، جداکنندهٔ جدید اضافه نکن
+    if (bounds.some((b) => Math.abs(b - z) < 3)) return;
+    setBounds((bs) => [...bs, clampZ(z, blankL)].sort((a, b) => a - b));
+  };
+
+  const sortedBounds = JSON.stringify([...bounds].sort((a, b) => a - b));
+  const dirtyBounds =
+    !(bounds.length === 0 && committedBounds.length === 0) &&
+    sortedBounds !== JSON.stringify([...committedBounds].sort((a, b) => a - b));
+
+  const complete = order.length === n && n > 0;
+  const dirtyOrder =
+    (validCommittedOrder ? JSON.stringify(committedOrder) : "[]") !==
+    (complete ? JSON.stringify(order) : "[]");
+  const dirty = dirtyBounds || dirtyOrder;
+
+  const toggle = (i: number) => setOrder((p) => (p.includes(i) ? p.filter((v) => v !== i) : [...p, i]));
+
+  return (
+    <div>
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="text-[10.5px] font-semibold text-mute">نواحی + ترتیب (دستی)</span>
+        <span className="rounded-full border border-edge px-2 py-0.5 font-mono text-[9px] font-bold text-mute">
+          {faNum(n)} ناحیه
+        </span>
+      </div>
+
+      <svg
+        ref={svgRef}
+        viewBox={`0 0 ${W} ${H}`}
+      className="aspect-square w-full select-none touch-none rounded-md border border-edge bg-[var(--theme-editor-bg)]"
+        style={{ cursor: dragIdx != null ? "ew-resize" : "crosshair" }}
+        onPointerDown={(e) => {
+          (e.target as Element).setPointerCapture?.(e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          if (dragIdx != null) {
+            const z = snapBound(pointerToZ(e), dragIdx);
+            setBounds((bs) => bs.map((b, i) => (i === dragIdx ? z : b)));
+          }
+        }}
+        onPointerUp={() => setDragIdx(null)}
+        onPointerLeave={() => {
+          if (dragIdx == null) setHoverIdx(null);
+          setDragIdx(null);
+        }}
+        onClick={onBgClick}
+      >
+        {/* سیلوئت قطعه */}
+        {/* Fill بسته است، اما strokeهای پروفایل باز رسم می‌شوند تا خط بسته‌شدن
+            در انتهای قطعه از میان حفره داخلی به‌عنوان خط اضافه دیده نشود. */}
+        <path
+          d={`${silhouette}${innerSilhouette ? ` ${innerSilhouette}` : ""}`}
+          fill="rgba(var(--rgb-brass), 0.18)"
+          fillRule="evenodd"
+        />
+        {[outerTop, outerBottom].map((d, i) => d && <path key={`outer-${i}`} d={d} fill="none" stroke="rgba(var(--rgb-brass), 0.5)" strokeWidth={1} />)}
+        {[innerTop, innerBottom].map((d, i) => d && <path key={`inner-${i}`} d={d} fill="none" stroke="var(--color-teal)" strokeWidth={1.1} />)}
+        {tipPair && <>
+          <line x1={X(tipPair.outerTip.z)} y1={Y(tipPair.outerTip.r)} x2={X(tipPair.innerTip.z)} y2={Y(tipPair.innerTip.r)} stroke="rgba(var(--rgb-brass), 0.5)" strokeWidth={1} />
+          <line x1={X(tipPair.outerTip.z)} y1={2 * YC - Y(tipPair.outerTip.r)} x2={X(tipPair.innerTip.z)} y2={2 * YC - Y(tipPair.innerTip.r)} stroke="rgba(var(--rgb-brass), 0.5)" strokeWidth={1} />
+        </>}
+
+        {/* نواحی */}
+        {zones.map((z, i) => {
+          const pos = order.indexOf(i);
+          const selected = pos >= 0;
+          const xa = X(z.a);
+          const xb = X(z.b);
+          const cx = (xa + xb) / 2;
+          return (
+            <g key={i}>
+              <rect
+                x={xa}
+                y={DIV_TOP}
+                width={Math.max(0.5, xb - xa)}
+                height={Math.max(1, DIV_BOTTOM - DIV_TOP)}
+                fill={selected ? "rgba(var(--rgb-teal), 0.14)" : "transparent"}
+              />
+              {/* شماره اولویت */}
+              <g onClick={(e) => { e.stopPropagation(); toggle(i); }} className="cursor-pointer">
+                {selected ? (
+                  <>
+                    <circle cx={cx} cy={NUM_Y} r={9} fill="var(--color-copper)" stroke="var(--theme-editor-bg)" strokeWidth={1.5} />
+                    <text x={cx} y={NUM_Y + 3.5} textAnchor="middle" fontSize={10} fontWeight={800} fontFamily="Vazirmatn, sans-serif" fill="#fff7ec">
+                      {faNum(pos + 1)}
+                    </text>
+                  </>
+                ) : (
+                  <g className="transition-opacity hover:opacity-100" opacity={0.55}>
+                    <circle cx={cx} cy={NUM_Y} r={8.5} fill="none" stroke="var(--color-dim)" strokeWidth={1} strokeDasharray="2.5 2" />
+                    <text x={cx} y={NUM_Y + 3} textAnchor="middle" fontSize={9} fontWeight={700} fontFamily="Vazirmatn, sans-serif" fill="var(--color-dim)">
+                      {faNum(i + 1)}
+                    </text>
+                  </g>
+                )}
+              </g>
+            </g>
+          );
+        })}
+
+        {/* خطوط تقسیم (قابل کشیدن) */}
+        {bounds.map((b, i) => {
+          const x = X(b);
+          const active = dragIdx === i;
+          const hov = hoverIdx === i;
+          return (
+            <g
+              key={i}
+              className="cursor-ew-resize"
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                (e.target as Element).setPointerCapture?.(e.pointerId);
+                setDragIdx(i);
+              }}
+              onPointerEnter={() => setHoverIdx(i)}
+              onPointerLeave={() => setHoverIdx(null)}
+            >
+              <rect x={x - 5} y={DIV_TOP - 4} width={10} height={Math.max(12, DIV_BOTTOM - DIV_TOP + 8)} fill="transparent" />
+              <line x1={x} y1={DIV_TOP} x2={x} y2={DIV_BOTTOM} stroke={active || hov ? "var(--color-brass2)" : "var(--color-teal)"} strokeWidth={1.6} strokeDasharray="4 3" />
+              {/* دستگیره بالای مرز */}
+              <circle cx={x} cy={DIV_TOP} r={active ? 5 : hov ? 4.5 : 4} fill={active || hov ? "var(--color-brass2)" : "var(--color-teal)"} stroke="var(--theme-editor-bg)" strokeWidth={1.5} />
+              <text x={x} y={DIV_TOP - 8} textAnchor="middle" fontSize={8} fontFamily="JetBrains Mono, monospace" fill={active || hov ? "var(--color-brass2)" : "var(--color-teal)"} fontWeight={700}>
+                {Math.round(b)}
+              </text>
+              {/* دکمهٔ حذف مرز */}
+              {(active || hov) && (
+                <g
+                  className="cursor-pointer"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setBounds((bs) => bs.filter((_, j) => j !== i));
+                  }}
+                >
+                  <circle cx={x + 10} cy={DIV_TOP} r={5.5} fill="var(--color-danger)" stroke="var(--theme-editor-bg)" strokeWidth={1.2} />
+                  <text x={x + 10} y={DIV_TOP + 3} textAnchor="middle" fontSize={9} fontWeight={900} fill="#fff">
+                    ×
+                  </text>
+                </g>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+
+      <p className="mt-1 text-[9.5px] leading-4 text-dim">
+        <span className="text-teal">مرزها را بکشید یا روی پس‌زمینه کلیک کنید تا جداکنندهٔ جدید شود</span>؛ برای حذف یک مرز، روی آن بروید و × را بزنید. سپس روی دایره‌های شماره کلیک کنید تا ترتیب تراش مشخص شود و در نهایت «تأیید» را بزنید.
+      </p>
+
+      <div className="mt-1.5 flex gap-1.5">
+        <button
+          onClick={() => onConfirm({ bounds: [...bounds].sort((a, b) => a - b), order: complete ? order : [] })}
+          disabled={!dirty}
+          className={cn("btn btn-brass flex-1 justify-center !py-2 text-[12px] font-bold", !dirty && "opacity-40")}
+          title="اعمال نواحی و ترتیب و ساخت جی‌کد"
+        >
+          <IconCheck className="h-4 w-4" />
+          تأیید و ساخت جی‌کد
+        </button>
+        <button
+          onClick={() => {
+            /* بازنشانی روی نوک قله‌های تقسیم خودکار (نه وسط نواحی/دره‌ها) */
+            const bz = autoZones.slice(0, -1).map((z) => z.b);
+            setBounds(bz.map((v) => clampZ(Math.round(v), blankL)));
+            setOrder([]);
+            onReset({ defaults: true });
+          }}
+          className="btn justify-center !py-2 text-[12px]"
+          title="بازگشت به تقسیم خودکار بر اساس قله‌ها و دره‌ها"
+        >
+          خودکار
+        </button>
+      </div>
+      {order.length > 0 && !complete && (
+        <p className="mt-1 text-center text-[9.5px] text-copper">
+          {faNum(order.length)} از {faNum(n)} ناحیه اولویت دارد — برای ترتیب کامل، همهٔ نواحی را انتخاب کنید
+        </p>
+      )}
+    </div>
+  );
+}
+function Toggle({ label, on, onChange }: { label: string; on: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button
+      onClick={() => onChange(!on)}
+      className="flex w-full items-center justify-between rounded-md border border-edge bg-panel2 px-2.5 py-1.5 text-right transition-colors hover:border-edge2"
+    >
+      <span className="text-[11.5px] font-semibold text-ink/85">{label}</span>
+      <span className={cn("relative h-4 w-8 shrink-0 rounded-full border transition-colors", on ? "border-brass/60 bg-brass/30" : "border-edge2 bg-bg")}>
+        <span
+          className={cn(
+            "absolute top-1/2 h-3 w-3 -translate-y-1/2 rounded-full transition-all",
+            on ? "right-0.5 bg-brass2 shadow-[0_0_8px_rgba(243,194,107,0.6)]" : "right-[calc(100%-14px)] bg-dim"
+          )}
+        />
+      </span>
+    </button>
+  );
+}
+
+/* memo: والد هنگام پخش شبیه‌سازی با هر خط جی‌کد رندر می‌شود؛ این پنل فقط با تغییر params/preset بازرندر شود */
+export default memo(ControlsPanel);
