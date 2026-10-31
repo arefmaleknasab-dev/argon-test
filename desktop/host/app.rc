@@ -1,0 +1,40 @@
+// -----------------------------------------------------------------------------
+//  منابع ویندوز: آیکن اجرایی، اطلاعات نسخه و مانیفست
+//  آیکن (ID 1) به‌صورت داخلی در EXE قرار می‌گیرد تا در Explorer، نوار وظیفه،
+//  Alt+Tab و دکمهٔ Start ویندوز ۱۰/۱۱ درست نمایش داده شود.
+// -----------------------------------------------------------------------------
+#include <windows.h>
+
+1 ICON "../assets/kharraatcode.ico"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"   /* US English, Unicode */
+        BEGIN
+            VALUE "CompanyName",      "KharraatCode"
+            VALUE "FileDescription",  "KharraatCode CNC Lathe G-Code Simulator"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "KharraatCode"
+            VALUE "OriginalFilename", "KharraatCode.exe"
+            VALUE "ProductName",      "KharraatCode - CNC Lathe G-Code"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "LegalCopyright",   "KharraatCode"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+/* مانیفست: DPI آگاه (تصویر شارپ روی نمایشگرهای HiDPI) + اجرا با دسترسی عادی */
+1 24 "app.manifest"
