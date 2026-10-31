@@ -297,6 +297,9 @@ static bool g_hatPipe = false;
 static bool g_notifiedDownload = false;
 static std::wstring g_lastDownload;
 static std::wstring g_noticeDir;
+static int g_loadAttempts = 0;
+static std::wstring g_appUrlPrefix;      // پیشوند آدرس محلی صفحهٔ برنامه
+static std::wstring g_appUrlPrefixEnc;   // همان، به‌صورت درصدگذاری‌شده
 static int g_fixedW = 0;   // اندازهٔ قطعی پنجره (شامل قاب) برای حالت اندازهٔ ثابت
 static int g_fixedH = 0;
 
@@ -324,6 +327,26 @@ static std::string UrlDecode(const std::string& in) {
             }
         }
         out.push_back(in[i]);
+    }
+    return out;
+}
+
+// درصدگذاری مسیر برای file:// (نام پوشه‌های فارسی/فاصله‌دار)
+static std::wstring PercentEncodeUrl(const std::wstring& url) {
+    static const wchar_t* hexDigits = L"0123456789ABCDEF";
+    std::string utf8 = WideToUtf8(url);
+    std::wstring out;
+    out.reserve(utf8.size() * 3);
+    for (unsigned char c : utf8) {
+        bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+                    c == '_' || c == '.' || c == '~' || c == '/' || c == ':' || c == '?';
+        if (keep) {
+            out.push_back((wchar_t)c);
+        } else {
+            out.push_back(L'%');
+            out.push_back(hexDigits[(c >> 4) & 0xF]);
+            out.push_back(hexDigits[c & 0xF]);
+        }
     }
     return out;
 }
@@ -448,14 +471,35 @@ class NavigationDoneHandler : public ComBase<ICoreWebView2NavigationCompletedEve
         BOOL ok = FALSE;
         args->get_IsSuccess(&ok);
         if (ok) {
+            g_loadAttempts = 0;
             // پشتیبان کپی در کلیپ‌بورد پس از هر بارگذاری دوباره نصب می‌شود
             g_webview->ExecuteScript(kClipboardGrantScript, nullptr);
             PostMessageW(g_hwnd, WM_APP_LOADED, 0, 0);
-        } else {
-            COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
-            args->get_WebErrorStatus(&status);
-            Log("navigation failed, status=" + std::to_string((int)status));
+            return S_OK;
         }
+
+        COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+        args->get_WebErrorStatus(&status);
+        Log("navigation failed, status=" + std::to_string((int)status));
+
+        // تلاش دوباره با آدرس درصدگذاری‌شده (مسیرهای دارای حرف فارسی یا فاصله)
+        if (g_loadAttempts < 2) {
+            g_loadAttempts++;
+            std::wstring alt = g_appUrlPrefixEnc + L"?v=" + Utf8ToWide(APP_VERSION) + L"&r=" +
+                               std::to_wstring(g_loadAttempts);
+            Log("retry navigation -> " + WideToUtf8(alt));
+            g_webview->Navigate(alt.c_str());
+            return S_OK;
+        }
+
+        std::wstring msg = L"بارگذاری صفحهٔ برنامه ممکن نشد.\r\n\r\n"
+                           L"مسیر برنامه:\r\n" + g_exeDir +
+                           L"\r\n\r\nراه‌حل‌ها:\r\n"
+                           L"۱) فایل ZIP را کامل استخراج کنید و برنامه را از داخل ZIP اجرا نکنید.\r\n"
+                           L"۲) پوشهٔ برنامه را در مسیری ساده مثل C:\\KharraatCode بگذارید.\r\n"
+                           L"۳) اگر ضدویروس فایل app\\index.html را قرنطینه کرده، آن را آزاد کنید.\r\n\r\n"
+                           L"کد خطا: " + std::to_wstring((int)status);
+        MessageBoxW(g_hwnd, msg.c_str(), L"خراط‌کد — خطای بارگذاری", MB_OK | MB_ICONERROR);
         return S_OK;
     }
 
@@ -464,11 +508,10 @@ class NavigationDoneHandler : public ComBase<ICoreWebView2NavigationCompletedEve
 };
 
 // آدرس‌های مجاز: فقط فایل صفحهٔ خود برنامه (و about:blank که WebView2 در شروع می‌سازد)
-static std::wstring g_appUrlPrefix;
-
 static bool IsAppUrl(const std::wstring& url) {
     if (url.empty() || url == L"about:blank") return true;
     if (!g_appUrlPrefix.empty() && url.rfind(g_appUrlPrefix, 0) == 0) return true;
+    if (!g_appUrlPrefixEnc.empty() && url.rfind(g_appUrlPrefixEnc, 0) == 0) return true;
     return false;
 }
 
@@ -1072,6 +1115,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     for (auto ch : pagePath) url += (ch == L'\\') ? L'/' : ch;
     g_homeUrl = url + L"?v=" + Utf8ToWide(APP_VERSION);
     g_appUrlPrefix = url;
+    g_appUrlPrefixEnc = PercentEncodeUrl(url);
 
     // پوشهٔ دادهٔ WebView2 کنار برنامه؛ اگر پوشهٔ برنامه قابل نوشتن نبود
     // (مثلاً نصب در Program Files) به AppData کاربر می‌رود
