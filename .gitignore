@@ -1,0 +1,17 @@
+# وابستگی‌ها و خروجی‌های ساخت
+node_modules/
+dist/
+release/
+out/
+*.log
+
+# فایل‌های موقت ویندوز هنگام اجرای برنامه
+_INcoming/
+_UserData/
+
+# سیستم‌عامل و ادیتور
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
